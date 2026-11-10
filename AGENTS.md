@@ -4,6 +4,11 @@
 This is a scientific research codebase. But we ultimately
 want something very fast and efficient.
 
+## Referring
+- within a branch, consider spec.md and code-review.md or similar files as intermediates
+- These will not make it to the main branch
+- Do not refer to spec.md in README, or to code-review.md
+
 ## Development rules
 - Prefer simple, modular implementations.
 - Do not introduce unnecessary dependencies.
