@@ -210,7 +210,6 @@ fn sketch_without_algorithm_defaults_to_minhash() {
 fn sketch_rejects_unimplemented_and_unknown_algorithms() {
     let t = Workspace::new();
     for name in [
-        "fracminhash",
         "bottomk",
         "minimizer",
         "open-syncmer",
@@ -219,7 +218,7 @@ fn sketch_rejects_unimplemented_and_unknown_algorithms() {
     ] {
         t.failure(
             &["sketch", "-a", name, "-k", "3", "good.fa", "-o", "out"],
-            &format!("{name} is not implemented yet; implemented: minhash"),
+            &format!("{name} is not implemented yet; implemented: minhash, fracminhash"),
         );
     }
     for name in ["MinHash", "sha1", ""] {
@@ -965,11 +964,10 @@ fn compare_rejects_old_empty_placeholders() {
 }
 
 #[test]
-fn compare_halts_unless_both_sketches_are_minhash() {
+fn compare_halts_unless_both_sketches_are_implemented() {
     let t = Workspace::new();
     identical_pair(&t);
     for name in [
-        "fracminhash",
         "bottomk",
         "minimizer",
         "open-syncmer",
@@ -983,7 +981,7 @@ fn compare_halts_unless_both_sketches_are_minhash() {
         t.failure(
             &["compare", "a.aiips", "other.aiips"],
             &format!(
-                "comparison requires two minhash sketches (a.aiips: minhash, other.aiips: {name})"
+                "comparison requires two sketches of one algorithm, minhash or fracminhash (a.aiips: minhash, other.aiips: {name})"
             ),
         );
         t.failure(
@@ -991,11 +989,11 @@ fn compare_halts_unless_both_sketches_are_minhash() {
             &format!("(other.aiips: {name}, other.aiips: {name})"),
         );
     }
-    // A sequence input is never sketched to match a non-minhash sketch.
+    // A sequence input is never sketched to match an unimplemented sketch.
     t.write("other.aiips", b"aiips-sketch v1 algorithm=bottomk\n");
     t.failure(
         &["compare", "good.fa", "other.aiips", "-k", "3"],
-        "comparison requires two minhash sketches (good.fa: fasta/fastq, other.aiips: bottomk)",
+        "comparison requires two sketches of one algorithm, minhash or fracminhash (good.fa: fasta/fastq, other.aiips: bottomk)",
     );
     t.write("other.aiips", b"aiips-sketch v1 algorithm=hyperloglog\n");
     t.failure(
@@ -1114,7 +1112,9 @@ fn compare_double_dash_and_escaped_paths() {
 fn compare_help() {
     for flag in ["-h", "--help"] {
         let stdout = Workspace::new().success(&["compare", flag]);
-        assert!(stdout.contains("Usage: aiips compare INPUT_A INPUT_B [-k LENGTH]"));
+        assert!(stdout.contains(
+            "Usage: aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED]"
+        ));
         assert!(stdout.contains("AF is -1"));
     }
 }
@@ -1177,9 +1177,9 @@ reject!(
     "unknown option"
 );
 reject!(
-    compare_sketch_options_rejected,
-    ["compare", "empty.aiips", "other.aiips", "-a", "minhash"],
-    "unknown option"
+    compare_unimplemented_algorithm_rejected,
+    ["compare", "empty.aiips", "other.aiips", "-a", "bottomk"],
+    "bottomk is not implemented yet"
 );
 reject!(
     compare_stdin_first,
@@ -1671,5 +1671,434 @@ fn sketch_windows_accepts_both_separator_styles_for_path_validation() {
             ],
             "directory",
         );
+    }
+}
+
+// ---------------------------------------------------------------- FracMinHash
+
+/// Library-built FracMinHash sketch bytes, an independent path to the CLI's.
+fn frac_bytes(fasta: &[u8], k: usize, scaled: u64, seed: u64) -> Vec<u8> {
+    use aiips::sketch::fracminhash::{FracMinHashParams, FracMinHashSketch};
+    let p = FracMinHashParams::new(std::num::NonZeroUsize::new(k).unwrap(), scaled, seed).unwrap();
+    FracMinHashSketch::build(fasta, p).unwrap().to_bytes()
+}
+
+fn frac_library_row(t: &Workspace, a: &str, b: &str) -> String {
+    use aiips::sketch::{fracminhash, parse, Sketch};
+    let load = |name: &str| match parse(&fs::read(t.path(name)).unwrap()).unwrap() {
+        Sketch::FracMinHash(sketch) => sketch,
+        other => panic!("{other:?}"),
+    };
+    let e = fracminhash::estimate(&load(a), &load(b)).unwrap();
+    format!(
+        "{a}\t{b}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t-1\t-1\t{:.6}\t{:.6}\n",
+        e.jaccard,
+        e.containment_a_in_b,
+        e.containment_b_in_a,
+        e.ani,
+        e.ani_containment_a_in_b,
+        e.ani_containment_b_in_a
+    )
+}
+
+fn frac(t: &Workspace, input: &str, name: &str, extra: &[&str]) -> String {
+    let mut args = vec!["sketch", "-a", "fracminhash", input, "-o", name];
+    args.extend(extra);
+    t.success(&args)
+}
+
+#[test]
+fn sketch_fracminhash_records_parameters_and_matches_library() {
+    let t = Workspace::new();
+    let stdout = frac(
+        &t,
+        "good.fa",
+        "a",
+        &["-k", "3", "--scaled", "1", "--seed", "7"],
+    );
+    assert_eq!(
+        stdout,
+        format!("{STATS}\ngood.fa\t2\t13\t2\t3\t7\noutput\ta.aiips\n")
+    );
+    let text = fs::read_to_string(t.path("a.aiips")).unwrap();
+    let expected = frac_bytes(include_bytes!("fixtures/sample.fa"), 3, 1, 7);
+    assert_eq!(text.as_bytes(), expected);
+    assert!(text.starts_with(
+        "aiips-sketch v1 algorithm=fracminhash k=3 scaled=1 seed=7 hash=murmur3-fmix64 canonical=true size="
+    ));
+    let size: usize = text
+        .lines()
+        .next()
+        .unwrap()
+        .rsplit_once("size=")
+        .unwrap()
+        .1
+        .parse()
+        .unwrap();
+    assert!(size > 0);
+    assert_eq!(text.lines().count(), 2 + size);
+    // FASTA, FASTQ and gzip inputs with identical sequences give identical sketches.
+    for (input, name) in [("good.fq", "b"), ("good.fa.gz", "c"), ("good.fq.gz", "d")] {
+        frac(
+            &t,
+            input,
+            name,
+            &["-k", "3", "--scaled", "1", "--seed", "7"],
+        );
+        assert_eq!(
+            fs::read_to_string(t.path(&format!("{name}.aiips"))).unwrap(),
+            text
+        );
+    }
+}
+
+#[test]
+fn sketch_fracminhash_defaults_and_empty_sketch_warning() {
+    let t = Workspace::new();
+    let sequence = "GATTACAGGCTTAACGTTAGCCATGCAAGTCTAGGCATCG";
+    t.write("long.fa", format!(">l\n{sequence}\n").as_bytes());
+    let expected = frac_bytes(format!(">l\n{sequence}\n").as_bytes(), 21, 1000, 42);
+    let header = "aiips-sketch v1 algorithm=fracminhash k=21 scaled=1000 seed=42 hash=murmur3-fmix64 canonical=true size=";
+    assert!(String::from_utf8_lossy(&expected).starts_with(header));
+    let output = t.run(&["sketch", "-a", "fracminhash", "long.fa", "-o", "out"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{STATS}\nlong.fa\t1\t40\t0\t21\t20\noutput\tout.aiips\n")
+    );
+    assert_eq!(fs::read(t.path("out.aiips")).unwrap(), expected);
+    // Fixed seed: none of the 20 distinct 21-mers falls under the threshold.
+    assert!(String::from_utf8_lossy(&expected).starts_with(&format!("{header}0\n")));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        "aiips: warning: out.aiips: no k-mer hash is at or below the scaled=1000 threshold; the sketch is empty and cannot be compared\n"
+    );
+    for pair in [["out.aiips", "out.aiips"], ["long.fa", "out.aiips"]] {
+        t.failure(
+            &["compare", pair[0], pair[1]],
+            ": fracminhash sketch has no hash values; containment is undefined; use a smaller --scaled",
+        );
+    }
+    // Inputs without valid k-mers are still refused, creating nothing.
+    t.failure(
+        &["sketch", "-a", "fracminhash", "good.fa", "-o", "none"],
+        "no valid k-mers of length 21",
+    );
+    assert!(!t.path("none.aiips").exists());
+}
+
+#[test]
+fn sketch_validates_fracminhash_parameters() {
+    let t = Workspace::new();
+    for (args, message) in [
+        (
+            vec!["-a", "fracminhash", "--scaled", "0"],
+            "scaled must be an integer from 1",
+        ),
+        (
+            vec!["-a", "fracminhash", "--scaled", "-1"],
+            "scaled must be an integer from 1",
+        ),
+        (
+            vec!["-a", "fracminhash", "--scaled", "abc"],
+            "scaled must be an integer",
+        ),
+        (
+            vec!["-a", "fracminhash", "--scaled", "18446744073709551616"],
+            "scaled must be",
+        ),
+        (
+            vec!["-a", "fracminhash", "--scaled"],
+            "scaled must be an integer",
+        ),
+        (
+            vec!["-a", "fracminhash", "--scaled", "2", "--scaled", "2"],
+            "scaled may only be specified once",
+        ),
+        (vec!["-a", "fracminhash", "-k", "33"], "1 to 32"),
+        (
+            vec!["-a", "fracminhash", "-s", "8"],
+            "-s/--num-hashes applies only to minhash, not fracminhash",
+        ),
+        (
+            vec!["-a", "minhash", "--scaled", "10"],
+            "--scaled applies only to fracminhash, not minhash",
+        ),
+        (
+            vec!["--scaled", "10"],
+            "--scaled applies only to fracminhash",
+        ),
+    ] {
+        let mut full = vec!["sketch", "good.fa", "-o", "out"];
+        full.extend(args);
+        t.failure(&full, message);
+    }
+    assert!(!t.path("out.aiips").exists());
+}
+
+#[test]
+fn compare_fracminhash_matches_library_and_exact_cases() {
+    let t = Workspace::new();
+    let shared = "GATTACAGGCTTAACGTTAGCCATGCAAGTCTAGGCATCGTTGACCTAGGATCCATGGCA";
+    let extra = "TTGCAACGGTACCGATTGCATGCATCCGGAATTCGCGTATAGCTAGCATCGATCGGCTAA";
+    t.write("a.fa", format!(">a\n{shared}\n").as_bytes());
+    t.write("b.fa", format!(">b\n{shared}{extra}\n").as_bytes());
+    for (name, scaled) in [("1", "1"), ("2", "2")] {
+        frac(
+            &t,
+            "a.fa",
+            &format!("a{name}"),
+            &["-k", "11", "--scaled", scaled],
+        );
+        frac(
+            &t,
+            "b.fa",
+            &format!("b{name}"),
+            &["-k", "11", "--scaled", scaled],
+        );
+        let (a, b) = (format!("a{name}.aiips"), format!("b{name}.aiips"));
+        let forward = t.success(&["compare", &a, &b]);
+        assert!(
+            forward.ends_with(&frac_library_row(&t, &a, &b)),
+            "{forward}"
+        );
+        let backward = t.success(&["compare", &b, &a]);
+        assert!(backward.ends_with(&frac_library_row(&t, &b, &a)));
+    }
+    // At scaled=1 every k-mer is kept, and every 11-mer of A occurs in B.
+    let row = t.success(&["compare", "a1.aiips", "b1.aiips"]);
+    let fields: Vec<&str> = row.lines().last().unwrap().split('\t').collect();
+    assert_eq!(fields[3], "1.000000", "A is contained in B");
+    assert_eq!(fields[8], "1.000000");
+    // Identical, reverse-complement inputs report exact ones.
+    t.write("f.fa", b">f\nGATTACAGGCTTAACGTTAG\n");
+    t.write("r.fa", b">r\nCTAACGTTAAGCCTGTAATC\n");
+    frac(&t, "f.fa", "f", &["-k", "7", "--scaled", "1"]);
+    frac(&t, "r.fa", "r", &["-k", "7", "--scaled", "1"]);
+    assert!(t.success(&["compare", "f.aiips", "r.aiips"]).ends_with(
+        "\nf.aiips\tr.aiips\t1.000000\t1.000000\t1.000000\t1.000000\t-1\t-1\t1.000000\t1.000000\n"
+    ));
+}
+
+#[test]
+fn compare_fracminhash_sequence_inputs_use_options_or_sketch_parameters() {
+    let t = Workspace::new();
+    frac(&t, "good.fa", "f", &["-k", "3", "--scaled", "1"]);
+    let metrics = |out: &str| -> String {
+        let line = out.lines().last().unwrap();
+        line.splitn(3, '\t').nth(2).unwrap().to_owned()
+    };
+    let sketched = t.success(&["compare", "f.aiips", "f.aiips"]);
+    for args in [
+        vec![
+            "compare",
+            "good.fa",
+            "good.fq.gz",
+            "-a",
+            "fracminhash",
+            "-k",
+            "3",
+            "--scaled",
+            "1",
+        ],
+        vec!["compare", "f.aiips", "good.fq"],
+        vec![
+            "compare", "good.fq", "f.aiips", "--scaled", "1", "--seed", "42", "-k", "3",
+        ],
+        vec!["compare", "f.aiips", "good.fa", "-a", "fracminhash"],
+    ] {
+        let out = t.success(&args);
+        assert_eq!(metrics(&out), metrics(&sketched), "{args:?}");
+        assert!(out.starts_with(&format!("{STATS}\n")));
+    }
+    // Two sequence inputs: options are validated against the chosen algorithm.
+    for (args, message) in [
+        (
+            vec!["--scaled", "1"],
+            "--scaled applies only to fracminhash",
+        ),
+        (
+            vec!["-a", "fracminhash", "-s", "8"],
+            "-s/--num-hashes applies only to minhash",
+        ),
+        (
+            vec!["-a", "fracminhash", "--scaled", "0"],
+            "scaled must be an integer from 1",
+        ),
+        (vec!["-a", "minhash", "-s", "1"], "from 2 to 1000000"),
+    ] {
+        let mut full = vec!["compare", "good.fa", "good.fq", "-k", "3"];
+        full.extend(args);
+        t.failure(&full, message);
+    }
+}
+
+#[test]
+fn compare_options_must_match_sketch_inputs() {
+    let t = Workspace::new();
+    frac(&t, "good.fa", "f", &["-k", "3", "--scaled", "1"]);
+    t.sketch("good.fa", "m", &["-k", "3", "-s", "8"]);
+    for (sketch, args, message) in [
+        (
+            "f.aiips",
+            vec!["-a", "minhash"],
+            "-a minhash does not match algorithm=fracminhash recorded in f.aiips",
+        ),
+        (
+            "f.aiips",
+            vec!["--scaled", "2"],
+            "--scaled 2 does not match scaled=1 recorded in f.aiips",
+        ),
+        (
+            "f.aiips",
+            vec!["--seed", "1"],
+            "--seed 1 does not match seed=42 recorded in f.aiips",
+        ),
+        (
+            "f.aiips",
+            vec!["-k", "4"],
+            "-k 4 does not match k=3 recorded in f.aiips",
+        ),
+        (
+            "f.aiips",
+            vec!["-s", "8"],
+            "-s/--num-hashes applies only to minhash",
+        ),
+        (
+            "m.aiips",
+            vec!["-a", "fracminhash"],
+            "-a fracminhash does not match algorithm=minhash recorded in m.aiips",
+        ),
+        (
+            "m.aiips",
+            vec!["--scaled", "1"],
+            "--scaled applies only to fracminhash",
+        ),
+        (
+            "m.aiips",
+            vec!["-s", "9"],
+            "-s 9 does not match num_hashes=8 recorded in m.aiips",
+        ),
+        (
+            "m.aiips",
+            vec!["--seed", "2"],
+            "--seed 2 does not match seed=42 recorded in m.aiips",
+        ),
+    ] {
+        for pair in [[sketch, "good.fa"], ["good.fa", sketch]] {
+            let mut full = vec!["compare", pair[0], pair[1]];
+            full.extend(args.iter().copied());
+            t.failure(&full, message);
+        }
+    }
+    // Options are also checked when both inputs are sketches.
+    t.failure(
+        &["compare", "f.aiips", "f.aiips", "--scaled", "2"],
+        "--scaled 2 does not match scaled=1",
+    );
+    t.success(&[
+        "compare", "m.aiips", "good.fa", "-a", "minhash", "-s", "8", "--seed", "42",
+    ]);
+}
+
+#[test]
+fn compare_halts_on_mixed_algorithms_and_fracminhash_mismatches() {
+    let t = Workspace::new();
+    frac(
+        &t,
+        "good.fa",
+        "f",
+        &["-k", "3", "--scaled", "1", "--seed", "1"],
+    );
+    t.sketch("good.fa", "m", &["-k", "3"]);
+    t.failure(
+        &["compare", "m.aiips", "f.aiips"],
+        "comparison requires two sketches of one algorithm, minhash or fracminhash (m.aiips: minhash, f.aiips: fracminhash)",
+    );
+    t.failure(
+        &["compare", "f.aiips", "m.aiips"],
+        "(f.aiips: fracminhash, m.aiips: minhash)",
+    );
+    for (name, extra, message) in [
+        (
+            "k",
+            ["-k", "4", "--scaled", "1", "--seed", "1"],
+            "k (3 vs 4)",
+        ),
+        (
+            "s",
+            ["-k", "3", "--scaled", "2", "--seed", "1"],
+            "scaled (1 vs 2)",
+        ),
+        (
+            "seed",
+            ["-k", "3", "--scaled", "1", "--seed", "2"],
+            "seed (1 vs 2)",
+        ),
+    ] {
+        frac(&t, "good.fa", name, &extra);
+        t.failure(
+            &["compare", "f.aiips", &format!("{name}.aiips")],
+            &format!("sketch parameters differ: {message}; re-sketch with identical parameters"),
+        );
+    }
+}
+
+#[test]
+fn compare_rejects_corrupt_fracminhash_sketches() {
+    let t = Workspace::new();
+    frac(&t, "good.fa", "f", &["-k", "3", "--scaled", "1"]);
+    let text = fs::read_to_string(t.path("f.aiips")).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    let last = lines.pop().unwrap();
+    let swapped = format!(
+        "{}\n{last}\n{}\n",
+        lines[..lines.len() - 1].join("\n"),
+        lines[lines.len() - 1]
+    );
+    t.write("unsorted.aiips", swapped.as_bytes());
+    t.failure(
+        &["compare", "unsorted.aiips", "f.aiips"],
+        "not strictly increasing",
+    );
+    t.write("short.aiips", format!("{}\n", lines.join("\n")).as_bytes());
+    t.failure(&["compare", "short.aiips", "f.aiips"], "expected size=");
+    t.write(
+        "bounded.aiips",
+        text.replace("scaled=1 ", "scaled=18446744073709551615 ")
+            .as_bytes(),
+    );
+    t.failure(
+        &["compare", "bounded.aiips", "bounded.aiips"],
+        "exceeds max_hash",
+    );
+}
+
+#[test]
+fn compare_reports_saturated_fracminhash_size_instead_of_panicking() {
+    // 21 · size + 4096 saturates the read bound to u64::MAX for these sizes;
+    // the reader must still read the whole body and report the value count.
+    let t = Workspace::new();
+    frac(&t, "good.fa", "f", &["-k", "3", "--scaled", "1"]);
+    let text = fs::read_to_string(t.path("f.aiips")).unwrap();
+    let declared = text.lines().next().unwrap().rsplit_once("size=").unwrap().1;
+    let found = text.lines().count() - 2;
+    for size in [u64::MAX, u64::MAX / 21 + 1] {
+        t.write(
+            "huge.aiips",
+            text.replacen(&format!("size={declared}\n"), &format!("size={size}\n"), 1)
+                .as_bytes(),
+        );
+        let output = t.run(&["compare", "huge.aiips", "f.aiips"]);
+        assert_eq!(output.status.code(), Some(1), "size={size}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!(
+                "huge.aiips: invalid sketch: expected size={size} hash values, found {found}"
+            )),
+            "{stderr}"
+        );
+        assert!(output.stdout.is_empty());
     }
 }

@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use aiips::fastx::Summary;
-use aiips::sketch::minhash::Estimates;
+use aiips::sketch::Estimates;
 
 pub fn label(path: &Path) -> String {
     path.to_string_lossy()
@@ -35,7 +35,7 @@ pub fn statistics(
     Ok(())
 }
 
-/// AF is not estimable from a global MinHash, so both AF columns are -1.
+/// AF is not estimable from a global sketch, so both AF columns are -1.
 /// Containment-ANI columns are appended so existing column positions hold.
 pub fn comparison(
     output: &mut impl Write,
