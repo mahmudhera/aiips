@@ -1,79 +1,32 @@
-use std::env;
-use std::ffi::OsString;
-use std::fs::File;
+mod cli;
+mod commands;
+mod report;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_support;
+
 use std::io::{self, Write};
-use std::num::NonZeroUsize;
-use std::path::Path;
 use std::process::ExitCode;
 
-use aiips::fastx::summarize;
-
-const HELP: &str = "Usage: aiips [-k <length>] <input>...\n\n\
-    Summarize FASTA/FASTQ files (plain or gzip); use - for stdin.\n\
-    -k, --kmer-size <length>  Positive k-mer length [default: 21]\n\
-    -h, --help                Print help\n\n\
-    Counts overlapping A/C/G/T k-mers, accepting either case.\n\
-    Other bases break k-mer runs. FASTQ qualities are not filtered.";
-
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args_os().skip(1);
-    let mut k = NonZeroUsize::new(21).unwrap();
-    let mut inputs = Vec::<OsString>::new();
-    let mut positional_only = false;
-    while let Some(arg) = args.next() {
-        if !positional_only && (arg == "-h" || arg == "--help") {
-            println!("{HELP}");
-            return Ok(());
-        } else if !positional_only && arg == "--" {
-            positional_only = true;
-        } else if !positional_only && (arg == "-k" || arg == "--kmer-size") {
-            k = args
-                .next()
-                .and_then(|value| value.to_str().and_then(|s| s.parse().ok()))
-                .ok_or("k-mer length must be a positive integer fitting usize")?;
-        } else if !positional_only && arg != "-" && arg.to_string_lossy().starts_with('-') {
-            return Err(format!("unknown option: {}", arg.to_string_lossy()).into());
-        } else {
-            inputs.push(arg);
-        }
-    }
-    if inputs.is_empty() {
-        return Err(format!("no input files supplied\n{HELP}").into());
-    }
-    if inputs.iter().filter(|input| *input == "-").count() > 1 {
-        return Err("stdin (-) can only be supplied once".into());
-    }
-
+fn run() -> Result<(), String> {
+    let command = cli::parse(std::env::args_os().skip(1))?;
     let mut output = io::BufWriter::new(io::stdout().lock());
-    writeln!(
-        output,
-        "input\trecords\tbases\tnon_acgt_bases\tk\tvalid_kmers"
-    )?;
-    for input in inputs {
-        let path = Path::new(&input);
-        let result = if input == "-" {
-            summarize(io::stdin(), k).map_err(|error| error.to_string())
-        } else {
-            File::open(path)
-                .map_err(|error| error.to_string())
-                .and_then(|file| summarize(file, k).map_err(|error| error.to_string()))
-        };
-        let summary = result.map_err(|error| format!("{}: {error}", path.display()))?;
-        // Escape delimiters so unusual filenames cannot create extra TSV columns.
-        let label = path
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('\t', "\\t")
-            .replace('\r', "\\r")
-            .replace('\n', "\\n");
-        writeln!(
-            output,
-            "{label}\t{}\t{}\t{}\t{k}\t{}",
-            summary.records, summary.bases, summary.non_acgt_bases, summary.kmers
-        )?;
+    let result = commands::execute(command, &mut output);
+    finish_stdout(output, result)
+}
+
+/// On failure, discard buffered stdout instead of letting BufWriter's Drop
+/// retry the flush, which could print a success report for an output that
+/// has already been rolled back.
+fn finish_stdout<W: Write>(
+    output: io::BufWriter<W>,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    if result.is_err() {
+        drop(output.into_parts());
     }
-    output.flush()?;
-    Ok(())
+    result
 }
 
 fn main() -> ExitCode {
@@ -83,5 +36,78 @@ fn main() -> ExitCode {
             eprintln!("aiips: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestDirectory;
+    use std::cell::RefCell;
+    use std::num::NonZeroUsize;
+    use std::rc::Rc;
+
+    /// Fails its first write with a transient error, then accepts everything.
+    struct TransientWriter {
+        failed: bool,
+        sink: Rc<RefCell<Vec<u8>>>,
+    }
+
+    impl Write for TransientWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.failed {
+                self.failed = true;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.sink.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn failed_sketch(discard: bool) -> (Vec<u8>, bool) {
+        let directory = TestDirectory::new();
+        let input = directory.join("in.fa");
+        let destination = directory.join("out.aiips");
+        std::fs::write(&input, b">a\nACGT\n").unwrap();
+        let sink = Rc::new(RefCell::new(Vec::new()));
+        let mut output = io::BufWriter::new(TransientWriter {
+            failed: false,
+            sink: Rc::clone(&sink),
+        });
+        let result = commands::execute(
+            cli::Command::Sketch {
+                input,
+                output: destination.clone(),
+                k: NonZeroUsize::new(3).unwrap(),
+                force: false,
+            },
+            &mut output,
+        );
+        assert!(result.as_ref().unwrap_err().starts_with("stdout: "));
+        if discard {
+            assert!(finish_stdout(output, result).is_err());
+        } else {
+            drop(output);
+        }
+        let printed = sink.borrow().clone();
+        (printed, destination.exists())
+    }
+
+    #[test]
+    fn failed_report_is_not_printed_after_rollback() {
+        let (printed, exists) = failed_sketch(true);
+        assert!(!exists, "output must be rolled back");
+        assert!(printed.is_empty(), "{}", String::from_utf8_lossy(&printed));
+    }
+
+    #[test]
+    fn plain_bufwriter_drop_would_print_rolled_back_report() {
+        // Control: demonstrates the hazard finish_stdout guards against.
+        let (printed, exists) = failed_sketch(false);
+        assert!(!exists);
+        assert!(String::from_utf8_lossy(&printed).contains("output\t"));
     }
 }
