@@ -64,34 +64,65 @@ expect_error() {
 }
 
 stats=$'input\trecords\tbases\tnon_acgt_bases\tk\tvalid_kmers'
-metrics=$'input_a\tinput_b\tjaccard\tcontainment_a_in_b\tcontainment_b_in_a\tani\taf_a_to_b\taf_b_to_a'
+metrics=$'input_a\tinput_b\tjaccard\tcontainment_a_in_b\tcontainment_b_in_a\tani\taf_a_to_b\taf_b_to_a\tani_containment_a_in_b\tani_containment_b_in_a'
 # Known baseline for tests/fixtures/sample.* at k=3 (tests/cli.rs, sketch_format!).
 counts=$'2\t13\t2\t3\t7'
+ones=$'1.000000\t1.000000\t1.000000\t1.000000\t-1\t-1\t1.000000\t1.000000'
 fa=tests/fixtures/sample.fa
 fq=tests/fixtures/sample.fq.gz
+header='aiips-sketch v1 algorithm=minhash k=3 num_hashes=1000 seed=42 hash=murmur3-fmix64 canonical=true'
 
 expect_help "top-level help" --help
 expect_help "sketch help" sketch --help
 expect_help "compare help" compare --help
 
-expect_stdout "sketch" \
+expect_stdout "sketch fasta" \
     "$stats"$'\n'"$fa"$'\t'"$counts"$'\noutput\tsample.aiips' \
-    sketch "$fa" -k 3 -o sample
-[ -f sample.aiips ] && [ ! -s sample.aiips ] ||
-    fail "sketch: sample.aiips is not an empty file"
+    sketch "$fa" -a minhash -k 3 -o sample
+[ "$(head -n 1 sample.aiips)" = "$header" ] ||
+    fail "sketch: unexpected header: $(head -n 1 sample.aiips)"
+[ "$(wc -l <sample.aiips | tr -d ' ')" -eq 1002 ] ||
+    fail "sketch: expected 1002 lines (2 header lines + 1000 hash values)"
 
-expect_stdout "compare fasta vs gzip fastq" \
-    "$stats"$'\n'"$fa"$'\t'"$counts"$'\n'"$fq"$'\t'"$counts"$'\n\n'"$metrics"$'\n'"$fa"$'\t'"$fq"$'\t-1\t-1\t-1\t-1\t-1\t-1' \
+expect_stdout "sketch gzip fastq" \
+    "$stats"$'\n'"$fq"$'\t'"$counts"$'\noutput\treads.aiips' \
+    sketch "$fq" -a minhash -k 3 -o reads
+
+# Identical sequences in different formats must give identical sketches.
+cmp -s sample.aiips reads.aiips || fail "fasta and gzip fastq sketches differ"
+
+expect_stdout "compare identical sketches" \
+    "$stats"$'\nsample.aiips\t'"$counts"$'\nreads.aiips\t'"$counts"$'\n\n'"$metrics"$'\nsample.aiips\treads.aiips\t'"$ones" \
+    compare sample.aiips reads.aiips
+
+expect_stdout "sketch with different k" \
+    "$stats"$'\n'"$fa"$'\t2\t13\t2\t4\t5\noutput\tk4.aiips' \
+    sketch "$fa" -a minhash -k 4 -o k4
+
+expect_error "compare refuses mismatched parameters" "sketch parameters differ: k (3 vs 4)" \
+    compare sample.aiips k4.aiips
+expect_stdout "compare fasta vs gzip fastq (sketched in memory)" \
+    "$stats"$'\n'"$fa"$'\t'"$counts"$'\n'"$fq"$'\t'"$counts"$'\n\n'"$metrics"$'\n'"$fa"$'\t'"$fq"$'\t'"$ones" \
     compare "$fa" "$fq" -k 3
 
-expect_stdout "compare sketch round trip" \
-    "$stats"$'\nsample.aiips\tNA\tNA\tNA\tNA\tNA\n'"$fa"$'\t'"$counts"$'\n\n'"$metrics"$'\nsample.aiips\t'"$fa"$'\t-1\t-1\t-1\t-1\t-1\t-1' \
-    compare sample.aiips "$fa" -k 3
+expect_stdout "compare sketch vs fasta" \
+    "$stats"$'\nsample.aiips\t'"$counts"$'\n'"$fa"$'\t'"$counts"$'\n\n'"$metrics"$'\nsample.aiips\t'"$fa"$'\t'"$ones" \
+    compare sample.aiips "$fa"
 
+expect_error "compare refuses -k differing from a sketch" "-k 4 does not match k=3" \
+    compare sample.aiips "$fa" -k 4
+expect_stdout "sketch defaults to minhash" \
+    "$stats"$'\n'"$fa"$'\t'"$counts"$'\noutput\tdefault.aiips' \
+    sketch "$fa" -k 3 -o default
+cmp -s sample.aiips default.aiips || fail "sketch without -a differs from -a minhash"
+expect_error "sketch refuses reserved algorithm" "bottomk is not implemented yet" \
+    sketch "$fa" -a bottomk -k 3 -o missing
+[ ! -e missing.aiips ] || fail "refused sketch created missing.aiips"
+
+before=$(cat sample.aiips)
 expect_error "sketch refuses existing output" "use -f or --force" \
-    sketch "$fa" -k 3 -o sample
-[ -f sample.aiips ] && [ ! -s sample.aiips ] ||
-    fail "sketch refusal: sample.aiips was modified"
+    sketch "$fa" -a minhash -k 3 -o sample
+[ "$(cat sample.aiips)" = "$before" ] || fail "sketch refusal: sample.aiips was modified"
 
 expect_error "unknown command" "unknown command" bogus
 

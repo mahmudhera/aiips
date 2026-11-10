@@ -4,8 +4,10 @@
 ## Summary
 
 AIIPS means Anchor Indexed Island Probe Sketching. This project explores nested
-sketching. Currently, the CLI summarizes sequence files and implements placeholder
-sketch creation and comparisons; no sketching or similarity estimation is performed.
+sketching. Currently, the CLI builds classic MinHash sketches of FASTA/FASTQ files
+and compares two sketches, estimating Jaccard, containment, and ANI. Other sketch
+algorithms (fracminhash, bottomk, minimizer, open-syncmer, closed-syncmer,
+strobemer) are reserved names, not yet implemented.
 
 ## Build
 
@@ -28,9 +30,10 @@ in `Cargo.lock`.
 ./target/release/aiips sketch --help
 ./target/release/aiips compare --help
 
-./target/release/aiips sketch tests/fixtures/sample.fa -k 3 -o sample
-./target/release/aiips compare tests/fixtures/sample.fa tests/fixtures/sample.fq.gz -k 3
-./target/release/aiips compare sample.aiips tests/fixtures/sample.fa -k 3
+./target/release/aiips sketch data/phiX174_NC_001422.1.fasta -a minhash -o phix
+./target/release/aiips sketch tests/fixtures/sample.fa -a minhash -k 3 -o sample
+./target/release/aiips sketch tests/fixtures/sample.fq.gz -a minhash -k 3 -o reads
+./target/release/aiips compare sample.aiips reads.aiips
 ```
 
 The previous `aiips INPUT...` interface has been removed. A subcommand is required.
@@ -38,11 +41,20 @@ Stdin (`-`) is not supported. Use `--` before positional filenames beginning wit
 `-`; options must precede that separator. For output names beginning with `-`,
 pass an explicit relative path, such as `-o ./-sample`.
 
-### Create a placeholder sketch
+### Create a sketch
 
 ```text
-aiips sketch INPUT -o OUTPUT [-k LENGTH] [-f]
+aiips sketch INPUT -o OUTPUT [-a ALGORITHM] [-k LENGTH] [-s NUM] [--seed SEED] [-f]
 ```
+
+`-a`/`--algorithm` defaults to `minhash`, the only implemented algorithm, so
+commands without it keep working.
+Reserved names (fracminhash, bottomk, minimizer, open-syncmer, closed-syncmer,
+strobemer) are refused as "not implemented yet"; other names are unknown. MinHash
+options: `-k` from 1 to 32 (default 21), `-s`/`--num-hashes` from 2 to 1,000,000
+(default 1000), and `--seed`, any unsigned 64-bit integer (default 42). Each option
+may be given once. An input without any valid k-mer is refused and creates no
+output.
 
 Accepts exactly one plain or gzip-compressed FASTA/FASTQ file, detected by content.
 `-o`/`--output` is required. `.aiips` is appended unless that extension is already
@@ -55,8 +67,8 @@ Output existence, file type, input aliases, and the destination parent are check
 before scanning sequence content, then rechecked before installation. New output
 uses atomic exclusive creation and does not require filesystem hard-link support.
 
-The output is an **empty placeholder file**, containing no sequence information,
-parameters, or actual sketch data. Existing output paths are refused unless
+The input is fully parsed and sketched in one streaming pass before any output is
+created. Existing output paths are refused unless
 `-f`/`--force` is supplied. Force replacement is staged in the destination directory
 after input validation; malformed input or replacement failure preserves the old
 output. File identity checks on Unix reject input aliases, including case aliases,
@@ -92,40 +104,92 @@ output\tsample.aiips
 
 Examples show tab characters as `\t` for readability.
 
+### Sketch format
+
+`.aiips` files are text. Line 1 names the format, version, sketch type, and every
+parameter; line 2 records the input statistics; then come the `num_hashes` minima,
+one decimal value per line, in hash-function order:
+
+```text
+aiips-sketch v1 algorithm=minhash k=3 num_hashes=1000 seed=42 hash=murmur3-fmix64 canonical=true
+records=2 bases=13 non_acgt_bases=2 valid_kmers=7
+<minimum of hash function 0>
+...
+```
+
+Reading is strict: unknown, missing, or duplicate fields, a wrong value count,
+non-decimal values, carriage returns, a missing final newline, or another version
+are errors. Zero-byte files written by earlier placeholder versions are rejected
+with a hint to re-run `aiips sketch`.
+
+### MinHash
+
+Classic MinHash (Broder 1997): each of `s` hash functions keeps its minimum over
+the input's distinct canonical k-mers. A k-mer's canonical form is the smaller
+2-bit encoding (A=0, C=1, G=2, T=3) of the k-mer and its reverse complement, so
+sketches are strand-independent. Hash function `i` is
+`fmix64(kmer XOR seed_i)`, MurmurHash3's 64-bit finalizer with `seed_i` the `i`-th
+SplitMix64 output from `--seed`. This approximates, but does not guarantee,
+min-wise independence. Sketching costs `s` hash evaluations per k-mer and uses
+O(`s`) memory; sequences are never stored.
+
 ### Compare two inputs
 
 ```text
 aiips compare INPUT_A INPUT_B [-k LENGTH]
 ```
 
-Each input whose final extension or whole filename is `.aiips` (case-insensitive) must be a readable,
-zero-byte regular file. Nonempty sketches are rejected until a real format is
-implemented. Other inputs are parsed as plain/gzip FASTA/FASTQ. Two sequence files,
-two placeholders, or a mixed pair are supported.
+Each input is a sketch or a plain/gzip FASTA/FASTQ file; mixed pairs are
+supported, so commands written before sketches existed keep working. Files named
+`.aiips` (case-insensitive) must be sketches; other files are sketches when they
+start with the sketch header and are otherwise read as sequence.
 
-Output contains a statistics table, a blank line, and a comparison table. For
-placeholder inputs all five statistic fields, including `k`, are `NA`: an empty
-file contains no metadata. All six metric values are `-1`, meaning unavailable,
-**not measured similarity or distance**.
+Sequence inputs are sketched in memory with MinHash. When the other input is a
+MinHash sketch, its parameters are used and a given `-k` must equal its `k`.
+Otherwise `k` comes from `-k` (default 21) with the default 1000 hash functions
+and seed 42. A sequence input without valid k-mers is an error.
+
+Unless every sketch input is MinHash, `compare` halts and names each input's type.
+Two MinHash sketches must agree in `k`, `num_hashes`, `seed`, `hash`, and
+`canonical`; every differing field is reported.
+
+Output contains a statistics table, a blank line, and a
+comparison table:
 
 ```text
 input\trecords\tbases\tnon_acgt_bases\tk\tvalid_kmers
-sample.aiips\tNA\tNA\tNA\tNA\tNA
-tests/fixtures/sample.fa\t2\t13\t2\t3\t7
+sample.aiips\t2\t13\t2\t3\t7
+reads.aiips\t2\t13\t2\t3\t7
 
-input_a\tinput_b\tjaccard\tcontainment_a_in_b\tcontainment_b_in_a\tani\taf_a_to_b\taf_b_to_a
-sample.aiips\ttests/fixtures/sample.fa\t-1\t-1\t-1\t-1\t-1\t-1
+input_a\tinput_b\tjaccard\tcontainment_a_in_b\tcontainment_b_in_a\tani\taf_a_to_b\taf_b_to_a\tani_containment_a_in_b\tani_containment_b_in_a
+sample.aiips\treads.aiips\t1.000000\t1.000000\t1.000000\t1.000000\t-1\t-1\t1.000000\t1.000000
 ```
 
-Containment and AF (alignment fraction) have columns for both directions; Jaccard
-and ANI each have one column. No statistical definitions or estimators are
-implemented by these placeholders. `compare` does not accept `-o` or `--force`.
+Estimators, with `s` hash functions and minima `a_i`, `b_i`:
+
+- `jaccard`: `J = #{i : a_i = b_i} / s` (Broder 1997).
+- Distinct k-mer counts: `n = (s - 1) / Σ -ln(1 - a_i / 2^64)`, unbiased because
+  each term is exponential with rate `n` (Cohen 1997).
+- `containment_a_in_b`: `|A ∩ B| / |A|` with `|A ∩ B| = J / (1 + J) · (|A| + |B|)`
+  (Koslicki & Zabeti 2019), clamped to [0, 1].
+- `ani`: `1 - D`, with Mash distance `D = -(1/k) ln(2J / (1 + J))` and `D = 1` at
+  `J = 0` (Ondov et al. 2016), clamped at 0.
+- `ani_containment_a_in_b`: `C^(1/k)` under the simple mutation model (Blanca et
+  al. 2022; Hera et al. 2023), 0 when `C = 0`.
+- `af_a_to_b`, `af_b_to_a`: always `-1` (unavailable). Alignment fraction needs
+  k-mer positions, which a global MinHash discards: tools reporting AF map
+  positional seeds (FastANI via Mashmap, skani via chaining). Under the simple
+  mutation model containment is about `AF · q^k`, so one containment value cannot
+  separate AF from identity `q`.
+
+Values are printed with six decimals. Estimates have sampling error of roughly
+`sqrt(J(1 - J)/s)` for Jaccard and `1/sqrt(s)` relative error for the counts.
+`compare` does not accept `-o`, `--force`, or sketch options.
 
 ### Shared behavior
 
-`-k`/`--kmer-size` defaults to 21 and accepts any positive length fitting `usize`.
-Each command accepts this option once; repeated short/long spellings are errors.
-It applies to sequence statistics; placeholders cannot recover or validate `k`.
+`-k`/`--kmer-size` may be given once per command; repeated short/long spellings
+are errors.
 `valid_kmers` counts every overlapping A/C/G/T occurrence in either case, including
 repeats, rather than distinct k-mers. Other bases break valid runs. Windows never
 cross record boundaries; wrapped FASTA lines belong to one record. FASTQ quality
@@ -134,7 +198,7 @@ lengths are checked but qualities do not filter bases.
 Statistics and success output go to stdout. Errors identify the affected path
 where applicable, go to stderr, and return status 1; success returns 0. All inputs
 are validated before any success output is printed. Empty or malformed sequence
-files, missing files, and non-regular inputs are errors. Filenames in TSV escape
+files, missing files, non-regular inputs, and invalid sketch files are errors. Filenames in TSV escape
 backslash, tab, carriage return, and newline.
 
 Command-specific help takes precedence over invalid arguments anywhere before
@@ -147,15 +211,17 @@ Command-specific help takes precedence over invalid arguments anywhere before
   [skani](https://github.com/bluenote-1577/skani/blob/main/src/file_io.rs).
   Only gzip compression is enabled to keep dependencies small.
 - `src/kmer.rs` iterates borrowed forward-strand windows and zero-based positions
-  without per-k-mer allocation. Original case is preserved. Iteration takes
-  O(sequence length) time and O(1) extra space.
+  without per-k-mer allocation, and rolling canonical 2-bit k-mer codes for
+  k <= 32. Both take O(sequence length) time and O(1) extra space.
+- `src/hash.rs` provides MurmurHash3's fmix64 and SplitMix64.
+- `src/sketch/` holds the algorithm registry and `.aiips` format (`mod.rs`) and
+  MinHash construction and estimators (`minhash.rs`).
 - The binary separates argument parsing, command execution and output handling,
   and TSV formatting. Memory scales with parser buffering and the largest record.
 
-Hashing, canonicalization, real sketch serialization, similarity/ANI estimation,
+Sketch algorithms other than MinHash, AF estimation, k > 32, confidence intervals,
 quality filtering, parallel processing, and compression other than gzip remain
-unimplemented. The placeholder `.aiips` extension establishes no future binary
-format.
+unimplemented.
 
 ## Tests
 
@@ -192,7 +258,15 @@ the `badges` branch for the README badge. To measure locally (requires
 cargo llvm-cov --locked --ignore-filename-regex '(^|/)tests/'
 ```
 
-The library tests compare k-mer iteration with an exhaustive naive baseline.
+The library tests compare forward and canonical k-mer iteration with exhaustive
+naive baselines, and streamed MinHash sketches with a brute-force baseline over the
+distinct k-mer set. Estimators are checked against exact cases (identical,
+disjoint, and reverse-complement inputs), hand-computed formula values, synthetic
+sets with known Jaccard, containment, and cardinality (within 4 standard errors,
+fixed seeds), and the phiX174 genome in `data/` mutated in memory at known
+substitution rates (1% and 5%), where containment ANI recovers 1 - p within 0.008.
+SplitMix64 is checked against its published reference outputs, fmix64 by
+inversion.
 Integration tests exercise each command, all input combinations, gzip, known
 counts, output creation and preservation, errors, help, and removal of the old
 interface. They use Cargo's test executable and isolated temporary directories;

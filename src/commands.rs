@@ -1,13 +1,14 @@
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Write};
-use std::num::NonZeroUsize;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aiips::fastx::{summarize, Summary};
+use aiips::sketch::minhash::{self, MinHashParams, MinHashSketch};
+use aiips::sketch::{self as sketch_format, Sketch};
+use std::num::NonZeroUsize;
 
 use crate::{
-    cli::{is_sketch, Command},
+    cli::{is_sketch, Command, SketchParams},
     report,
 };
 
@@ -24,18 +25,147 @@ fn open_input(path: &Path) -> Result<(File, Metadata), String> {
     Ok((file, metadata))
 }
 
-fn compare_input(path: &Path, k: NonZeroUsize) -> Result<Option<Summary>, String> {
+/// Largest sketch file accepted: 1,000,000 values of at most 20 digits plus
+/// newline, with room for the two header lines.
+const MAX_SKETCH_BYTES: u64 = 21 * minhash::MAX_NUM_HASHES as u64 + 4096;
+
+fn read_sketch(path: &Path) -> Result<Sketch, String> {
     let (file, metadata) = open_input(path)?;
-    if !is_sketch(path) {
-        return summarize(file, k).map(Some).map_err(|e| error(path, e));
+    if metadata.len() > MAX_SKETCH_BYTES {
+        return Err(error(path, "too large to be an aiips sketch"));
     }
-    if metadata.len() != 0 {
-        return Err(error(
-            path,
-            "only empty .aiips placeholder sketches are supported",
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SKETCH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| error(path, e))?;
+    if bytes.len() as u64 > MAX_SKETCH_BYTES {
+        return Err(error(path, "too large to be an aiips sketch"));
+    }
+    sketch_format::parse(&bytes).map_err(|e| error(path, e))
+}
+
+/// A compare input: a sketch file, or a FASTA/FASTQ file sketched in memory.
+enum CompareInput {
+    Sketch(Sketch),
+    Sequence,
+}
+
+/// `.aiips` names must be sketches. Other files are sketches when they start
+/// with the sketch magic and are otherwise read as FASTA/FASTQ.
+fn classify(path: &Path) -> Result<CompareInput, String> {
+    if is_sketch(path) {
+        return read_sketch(path).map(CompareInput::Sketch);
+    }
+    let (file, _) = open_input(path)?;
+    let mut prefix = Vec::with_capacity(sketch_format::MAGIC.len());
+    file.take(sketch_format::MAGIC.len() as u64)
+        .read_to_end(&mut prefix)
+        .map_err(|e| error(path, e))?;
+    if prefix == sketch_format::MAGIC.as_bytes() {
+        read_sketch(path).map(CompareInput::Sketch)
+    } else {
+        Ok(CompareInput::Sequence)
+    }
+}
+
+/// Builds both comparison sketches. Sequence inputs take the parameters of a
+/// minhash sketch input (an explicit `-k` must match it), or the defaults.
+fn compare_sketches(paths: &[PathBuf; 2], k: Option<NonZeroUsize>) -> Result<[Sketch; 2], String> {
+    let inputs = [classify(&paths[0])?, classify(&paths[1])?];
+    let kind = |input: &CompareInput| match input {
+        CompareInput::Sketch(sketch) => sketch.algorithm().name(),
+        CompareInput::Sequence => "fasta/fastq",
+    };
+    if inputs.iter().any(
+        |input| matches!(input, CompareInput::Sketch(sketch) if !matches!(sketch, Sketch::MinHash(_))),
+    ) {
+        return Err(format!(
+            "comparison requires two minhash sketches ({}: {}, {}: {})",
+            paths[0].display(),
+            kind(&inputs[0]),
+            paths[1].display(),
+            kind(&inputs[1])
         ));
     }
-    Ok(None)
+    let template = paths
+        .iter()
+        .zip(&inputs)
+        .find_map(|(path, input)| match input {
+            CompareInput::Sketch(Sketch::MinHash(sketch)) => Some((path, &sketch.params)),
+            _ => None,
+        });
+    let params = match template {
+        Some((path, params)) => {
+            if let Some(k) = k.filter(|k| *k != params.k) {
+                return Err(format!(
+                    "-k {k} does not match k={} recorded in {}",
+                    params.k,
+                    path.display()
+                ));
+            }
+            params.clone()
+        }
+        None => MinHashParams::new(
+            k.unwrap_or(NonZeroUsize::new(minhash::DEFAULT_K).unwrap()),
+            minhash::DEFAULT_NUM_HASHES,
+            minhash::DEFAULT_SEED,
+        )?,
+    };
+    let mut sketches = Vec::with_capacity(2);
+    for (path, input) in paths.iter().zip(inputs) {
+        sketches.push(match input {
+            CompareInput::Sketch(sketch) => sketch,
+            CompareInput::Sequence => Sketch::MinHash(sketch_sequence(path, params.clone())?),
+        });
+    }
+    Ok(sketches.try_into().unwrap())
+}
+
+fn sketch_sequence(path: &Path, params: MinHashParams) -> Result<MinHashSketch, String> {
+    let (file, _) = open_input(path)?;
+    sketch_file(path, file, params)
+}
+
+/// Sketches an already-opened FASTA/FASTQ file; refuses inputs without k-mers.
+fn sketch_file(path: &Path, file: File, params: MinHashParams) -> Result<MinHashSketch, String> {
+    let k = params.k;
+    let sketch = MinHashSketch::build(file, params).map_err(|e| error(path, e))?;
+    if sketch.summary.kmers == 0 {
+        return Err(error(
+            path,
+            format!("no valid k-mers of length {k}; nothing to sketch"),
+        ));
+    }
+    Ok(sketch)
+}
+
+/// Halts unless both inputs are minhash sketches with identical parameters.
+fn minhash_pair<'a>(
+    paths: &[PathBuf; 2],
+    sketches: &'a [Sketch; 2],
+) -> Result<[&'a MinHashSketch; 2], String> {
+    match sketches {
+        [Sketch::MinHash(a), Sketch::MinHash(b)] => {
+            let differences = a.params.mismatches(&b.params);
+            if differences.is_empty() {
+                Ok([a, b])
+            } else {
+                Err(format!(
+                    "{} and {}: sketch parameters differ: {}; re-sketch with identical parameters",
+                    paths[0].display(),
+                    paths[1].display(),
+                    differences.join(", ")
+                ))
+            }
+        }
+        [a, b] => Err(format!(
+            "comparison requires two minhash sketches ({}: {}, {}: {})",
+            paths[0].display(),
+            a.algorithm().name(),
+            paths[1].display(),
+            b.algorithm().name()
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -204,35 +334,44 @@ impl OutputTransaction {
         source: &Metadata,
         output: &Path,
         force: bool,
+        contents: &[u8],
     ) -> Result<Self, String> {
         // A missing parent is reported by the create/rename below, so only the
         // existing-output safeguards need rechecking here.
         let existing = check_existing(input, source, output, force)?;
-        Self::install_checked(output, force, existing)
+        Self::install_checked(output, force, existing, contents)
     }
 
-    /// Installs after safeguards passed; `existing` is the recheck's result.
+    /// Installs `contents` after safeguards passed; `existing` is the
+    /// recheck's result.
     fn install_checked(
         output: &Path,
         force: bool,
         existing: Option<Metadata>,
+        contents: &[u8],
     ) -> Result<Self, String> {
         if !force {
-            // The placeholder is empty, so create it exclusively without requiring
-            // hard-link support. create_new is atomic even after the preflight.
-            OpenOptions::new()
+            // Exclusive creation needs no hard-link support and stays atomic
+            // even after the preflight. A failed write removes the new file.
+            let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(output)
                 .map_err(|e| install_error(output, e, false))?;
-            return Ok(Self {
+            let mut transaction = Self {
                 destination: output.into(),
                 backup: None,
                 installed: true,
-            });
+            };
+            if let Err(e) = file.write_all(contents).and_then(|()| file.flush()) {
+                drop(file);
+                return Err(transaction.with_rollback(error(output, e)));
+            }
+            return Ok(transaction);
         }
         let parent = parent_dir(output);
         let staged = StagedOutput::create(parent, output)?;
+        fs::write(staged.path(), contents).map_err(|e| error(output, e))?;
         if let Some(metadata) = existing.as_ref().filter(|m| m.is_file()) {
             fs::set_permissions(staged.path(), metadata.permissions())
                 .map_err(|e| error(output, e))?;
@@ -324,16 +463,23 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
         Command::Sketch {
             input,
             output: destination,
-            k,
+            params: SketchParams::MinHash(params),
             force,
         } => {
             let (file, metadata) = open_input(&input)?;
             preflight_output(&input, &metadata, &destination, force)?;
-            let summary = summarize(file, k).map_err(|e| error(&input, e))?;
-            let mut transaction =
-                OutputTransaction::install(&input, &metadata, &destination, force)?;
+            let sketch = sketch_file(&input, file, params)?;
+            let k = sketch.params.k;
+            let mut transaction = OutputTransaction::install(
+                &input,
+                &metadata,
+                &destination,
+                force,
+                &sketch.to_bytes(),
+            )?;
+            let summary = sketch.summary;
             let report = (|| -> io::Result<()> {
-                report::statistics(output, &[(&input, Some(&summary))], k)?;
+                report::statistics(output, &[(&input, &summary, k)])?;
                 writeln!(output, "output\t{}", report::label(&destination))?;
                 output.flush()
             })();
@@ -346,15 +492,18 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
             Ok(())
         }
         Command::Compare { inputs, k } => {
-            let first = compare_input(&inputs[0], k)?;
-            let second = compare_input(&inputs[1], k)?;
+            let sketches = compare_sketches(&inputs, k)?;
+            let [a, b] = minhash_pair(&inputs, &sketches)?;
+            let estimates = minhash::estimate(a, b)?;
             report::statistics(
                 output,
-                &[(&inputs[0], first.as_ref()), (&inputs[1], second.as_ref())],
-                k,
+                &[
+                    (&inputs[0], &a.summary, a.params.k),
+                    (&inputs[1], &b.summary, b.params.k),
+                ],
             )
             .map_err(|e| format!("stdout: {e}"))?;
-            report::comparison(output, &inputs)
+            report::comparison(output, &inputs, &estimates)
                 .and_then(|()| output.flush())
                 .map_err(|e| format!("stdout: {e}"))
         }
@@ -365,6 +514,19 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
 mod tests {
     use super::*;
     use crate::test_support::TestDirectory;
+    use aiips::sketch::minhash::MinHashParams;
+    use std::num::NonZeroUsize;
+
+    fn params(k: usize) -> MinHashParams {
+        MinHashParams::new(NonZeroUsize::new(k).unwrap(), 16, 42).unwrap()
+    }
+
+    /// Writes a minhash sketch of `fasta` to `path` and returns it.
+    fn write_sketch(path: &Path, fasta: &[u8], k: usize) -> MinHashSketch {
+        let sketch = MinHashSketch::build(fasta, params(k)).unwrap();
+        fs::write(path, sketch.to_bytes()).unwrap();
+        sketch
+    }
 
     struct FailingWriter {
         flush_only: bool,
@@ -397,7 +559,7 @@ mod tests {
             Command::Sketch {
                 input: input.path().into(),
                 output: destination.path().into(),
-                k: NonZeroUsize::new(3).unwrap(),
+                params: SketchParams::MinHash(params(3)),
                 force,
             },
             &mut FailingWriter { flush_only },
@@ -442,7 +604,8 @@ mod tests {
         fs::write(destination.path(), b"original result").unwrap();
         let source = fs::metadata(input.path()).unwrap();
         let mut transaction =
-            OutputTransaction::install(input.path(), &source, destination.path(), true).unwrap();
+            OutputTransaction::install(input.path(), &source, destination.path(), true, b"new")
+                .unwrap();
         let backup = transaction.backup.as_ref().unwrap().path().to_path_buf();
         fs::remove_file(destination.path()).unwrap();
         fs::create_dir(destination.path()).unwrap();
@@ -462,9 +625,14 @@ mod tests {
         let destination = directory.join("out.aiips");
         fs::write(&input, b">a\nACGT\n").unwrap();
         fs::write(&destination, b"original result").unwrap();
-        let transaction =
-            OutputTransaction::install(&input, &fs::metadata(&input).unwrap(), &destination, true)
-                .unwrap();
+        let transaction = OutputTransaction::install(
+            &input,
+            &fs::metadata(&input).unwrap(),
+            &destination,
+            true,
+            b"new sketch",
+        )
+        .unwrap();
         let backup = transaction.backup.as_ref().unwrap().path().to_path_buf();
         let warning = transaction
             .finish_with_cleanup(|path| {
@@ -475,7 +643,7 @@ mod tests {
         assert!(warning.contains("could not remove backup"));
         assert!(warning.contains(&backup.display().to_string()));
         assert!(warning.contains(&destination.display().to_string()));
-        assert_eq!(fs::read(destination).unwrap(), b"");
+        assert_eq!(fs::read(destination).unwrap(), b"new sketch");
         assert_eq!(fs::read(backup).unwrap(), b"original result");
     }
 
@@ -488,7 +656,7 @@ mod tests {
         let metadata = fs::metadata(&input).unwrap();
         preflight_output(&input, &metadata, &destination, false).unwrap();
         fs::write(&destination, b"competing result").unwrap();
-        let result = OutputTransaction::install(&input, &metadata, &destination, false);
+        let result = OutputTransaction::install(&input, &metadata, &destination, false, b"new");
         assert!(result.err().unwrap().contains("output already exists"));
         assert_eq!(fs::read(destination).unwrap(), b"competing result");
     }
@@ -496,13 +664,13 @@ mod tests {
     #[test]
     fn compare_statistics_and_flush_failures_identify_stdout() {
         let directory = TestDirectory::new();
-        let input = directory.join("in.fa");
-        fs::write(&input, b">a\nACGT\n").unwrap();
+        let input = directory.join("in.aiips");
+        write_sketch(&input, b">a\nACGT\n", 3);
         for flush_only in [false, true] {
             let result = execute(
                 Command::Compare {
                     inputs: [input.clone(), input.clone()],
-                    k: NonZeroUsize::new(3).unwrap(),
+                    k: None,
                 },
                 &mut FailingWriter { flush_only },
             );
@@ -527,21 +695,19 @@ mod tests {
             }
         }
         let directory = TestDirectory::new();
-        let input = directory.join("in.fa");
-        fs::write(&input, b">a\nACGT\n").unwrap();
-        let k = NonZeroUsize::new(3).unwrap();
-        let summary = summarize(File::open(&input).unwrap(), k).unwrap();
+        let input = directory.join("in.aiips");
+        let sketch = write_sketch(&input, b">a\nACGT\n", 3);
+        let k = sketch.params.k;
         let mut statistics = Vec::new();
         report::statistics(
             &mut statistics,
-            &[(&input, Some(&summary)), (&input, Some(&summary))],
-            k,
+            &[(&input, &sketch.summary, k), (&input, &sketch.summary, k)],
         )
         .unwrap();
         let result = execute(
             Command::Compare {
                 inputs: [input.clone(), input],
-                k,
+                k: None,
             },
             &mut LimitedWriter(statistics.len()),
         );
@@ -569,7 +735,7 @@ mod tests {
             // Simulates a directory created between the recheck and install.
             fs::create_dir(&destination).unwrap();
             fs::write(destination.join("keep"), b"keep").unwrap();
-            let message = OutputTransaction::install_checked(&destination, force, None)
+            let message = OutputTransaction::install_checked(&destination, force, None, b"new")
                 .err()
                 .unwrap();
             assert!(message.contains("output is a directory"), "{message}");
@@ -600,9 +766,10 @@ mod tests {
         let existing = fs::metadata(&destination).unwrap();
         // Make rename(output, backup) fail after the recheck observed a file.
         fs::remove_file(&destination).unwrap();
-        let message = OutputTransaction::install_checked(&destination, true, Some(existing))
-            .err()
-            .unwrap();
+        let message =
+            OutputTransaction::install_checked(&destination, true, Some(existing), b"new")
+                .err()
+                .unwrap();
         assert!(
             message.contains("could not move existing output aside"),
             "{message}"
@@ -613,6 +780,82 @@ mod tests {
         );
         assert!(!destination.exists());
         assert_no_staging_files(&directory);
+    }
+
+    #[test]
+    fn installs_exact_contents_with_and_without_force() {
+        let directory = TestDirectory::new();
+        let destination = directory.join("out.aiips");
+        OutputTransaction::install_checked(&destination, false, None, b"first")
+            .unwrap()
+            .finish();
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+        let existing = fs::metadata(&destination).unwrap();
+        OutputTransaction::install_checked(&destination, true, Some(existing), b"second")
+            .unwrap()
+            .finish();
+        assert_eq!(fs::read(&destination).unwrap(), b"second");
+        assert_no_staging_files(&directory);
+    }
+
+    #[test]
+    fn compare_halts_unless_both_sketches_are_minhash() {
+        let directory = TestDirectory::new();
+        let minhash = directory.join("m.aiips");
+        let other = directory.join("o.aiips");
+        write_sketch(&minhash, b">a\nACGTACGT\n", 3);
+        fs::write(
+            &other,
+            b"aiips-sketch v1 algorithm=fracminhash scaled=1000\n",
+        )
+        .unwrap();
+        for inputs in [
+            [minhash.clone(), other.clone()],
+            [other.clone(), minhash.clone()],
+            [other.clone(), other.clone()],
+        ] {
+            let mut stdout = Vec::new();
+            let error = execute(Command::Compare { inputs, k: None }, &mut stdout).unwrap_err();
+            assert!(
+                error.contains("comparison requires two minhash sketches"),
+                "{error}"
+            );
+            assert!(error.contains("fracminhash"), "{error}");
+            assert!(stdout.is_empty());
+        }
+    }
+
+    #[test]
+    fn compare_halts_on_parameter_mismatch_before_printing() {
+        let directory = TestDirectory::new();
+        let a = directory.join("a.aiips");
+        let b = directory.join("b.aiips");
+        write_sketch(&a, b">a\nACGTACGT\n", 3);
+        write_sketch(&b, b">a\nACGTACGT\n", 4);
+        let mut stdout = Vec::new();
+        let error = execute(
+            Command::Compare {
+                inputs: [a, b],
+                k: None,
+            },
+            &mut stdout,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("sketch parameters differ: k (3 vs 4)"),
+            "{error}"
+        );
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn oversized_sketch_files_are_refused_without_parsing() {
+        let directory = TestDirectory::new();
+        let big = directory.join("big.aiips");
+        let file = File::create(&big).unwrap();
+        file.set_len(MAX_SKETCH_BYTES + 1).unwrap();
+        let error = read_sketch(&big).unwrap_err();
+        assert!(error.contains("too large"), "{error}");
     }
 
     #[test]

@@ -81,7 +81,14 @@ mod tests {
             cli::Command::Sketch {
                 input,
                 output: destination.clone(),
-                k: NonZeroUsize::new(3).unwrap(),
+                params: cli::SketchParams::MinHash(
+                    aiips::sketch::minhash::MinHashParams::new(
+                        NonZeroUsize::new(3).unwrap(),
+                        16,
+                        42,
+                    )
+                    .unwrap(),
+                ),
                 force: false,
             },
             &mut output,
