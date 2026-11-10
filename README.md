@@ -31,8 +31,6 @@ in `Cargo.lock`.
 ```
 
 The previous `aiips INPUT...` interface has been removed. A subcommand is required.
-This removal and the stdin change were explicitly approved in SPEC.md, as a
-specific exception to the general CLI-preservation rule in AGENTS.md.
 Stdin (`-`) is not supported. Use `--` before positional filenames beginning with
 `-`; options must precede that separator. For output names beginning with `-`,
 pass an explicit relative path, such as `-o ./-sample`.
