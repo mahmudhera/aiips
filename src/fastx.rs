@@ -5,7 +5,7 @@ use needletail::{errors::ParseError, parse_fastx_reader};
 
 use crate::kmer::Kmers;
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
     pub records: u64,
     pub bases: u64,
@@ -19,6 +19,16 @@ pub struct Summary {
 /// FASTQ qualities are validated by the parser but are not used for filtering.
 /// Empty input and malformed records return errors; no partial summary is returned.
 pub fn summarize<R: Read + Send>(input: R, k: NonZeroUsize) -> Result<Summary, ParseError> {
+    summarize_with(input, k, |_| {})
+}
+
+/// Like [`summarize`], also passing each record's sequence (line breaks
+/// removed) to `visit`, so sketches are built in the same single pass.
+pub fn summarize_with<R: Read + Send>(
+    input: R,
+    k: NonZeroUsize,
+    mut visit: impl FnMut(&[u8]),
+) -> Result<Summary, ParseError> {
     let mut reader = parse_fastx_reader(input)?;
     let mut summary = Summary::default();
     while let Some(record) = reader.next() {
@@ -30,9 +40,8 @@ pub fn summarize<R: Read + Send>(input: R, k: NonZeroUsize) -> Result<Summary, P
             .iter()
             .filter(|base| !b"ACGTacgt".contains(base))
             .count() as u64;
-        for _kmer in Kmers::new(&sequence, k) {
-            summary.kmers += 1;
-        }
+        summary.kmers += Kmers::new(&sequence, k).count() as u64;
+        visit(&sequence);
     }
     Ok(summary)
 }
