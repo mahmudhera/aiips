@@ -34,6 +34,8 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test coverage badge script
+        run: scripts/test_coverage_badge.sh
 
   build-test:
     name: build-test (${{ matrix.os }})
@@ -68,3 +70,61 @@ jobs:
         run: cargo test --locked
       - name: Smoke-test subcommands
         run: scripts/smoke.sh target/release/aiips
+
+  # Measures line coverage of src/ (reported, never enforced) and, on main,
+  # publishes a shields.io endpoint file to the orphan `badges` branch.
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Only to force-push the badge file to `badges`.
+    env:
+      IGNORE_TESTS: "(^|/)tests/" # Excludes test code, including tests/common.
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component llvm-tools
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: coverage-${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - uses: taiki-e/install-action@v2.87.32
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      # Runs the full test suite instrumented, including the aiips binary that
+      # the integration tests launch.
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --locked --ignore-filename-regex "$IGNORE_TESTS" \
+            --json --summary-only --output-path coverage-summary.json
+      - name: Report coverage by file
+        run: |
+          {
+            echo '### Line coverage of `src/`'
+            echo '```'
+            cargo llvm-cov report --summary-only --ignore-filename-regex "$IGNORE_TESTS"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Build badge file
+        run: scripts/coverage_badge.sh coverage-summary.json coverage.json && cat coverage.json
+      - name: Publish badge
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dir=$(mktemp -d)
+          cp coverage.json "$dir/"
+          cd "$dir"
+          git init -q -b badges
+          git add coverage.json
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Coverage badge for ${GITHUB_SHA}"
+          # Force-push keeps `badges` at one commit. GITHUB_TOKEN pushes do not
+          # trigger workflows, so this cannot loop.
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:badges
