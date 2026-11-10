@@ -1,14 +1,16 @@
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aiips::sketch::minhash::{self, MinHashParams, MinHashSketch};
-use aiips::sketch::{self as sketch_format, Sketch};
-use std::num::NonZeroUsize;
+use aiips::fastx::Summary;
+use aiips::sketch::fracminhash::{self, FracMinHashSketch};
+use aiips::sketch::minhash::{self, MinHashSketch};
+use aiips::sketch::{self as sketch_format, Estimates, Sketch};
 
 use crate::{
-    cli::{is_sketch, Command, SketchParams},
+    cli::{is_sketch, AlgorithmOptions, Command, SketchParams},
     report,
 };
 
@@ -25,20 +27,25 @@ fn open_input(path: &Path) -> Result<(File, Metadata), String> {
     Ok((file, metadata))
 }
 
-/// Largest sketch file accepted: 1,000,000 values of at most 20 digits plus
-/// newline, with room for the two header lines.
-const MAX_SKETCH_BYTES: u64 = 21 * minhash::MAX_NUM_HASHES as u64 + 4096;
-
+/// Reads a sketch file after bounding its size by its own header (see
+/// `sketch::max_file_bytes`): a FracMinHash file by its declared size, every
+/// other file by the largest MinHash sketch.
 fn read_sketch(path: &Path) -> Result<Sketch, String> {
-    let (file, metadata) = open_input(path)?;
-    if metadata.len() > MAX_SKETCH_BYTES {
-        return Err(error(path, "too large to be an aiips sketch"));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_SKETCH_BYTES + 1)
+    let (mut file, metadata) = open_input(path)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(sketch_format::HEADER_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|e| error(path, e))?;
-    if bytes.len() as u64 > MAX_SKETCH_BYTES {
+    let limit = sketch_format::max_file_bytes(&bytes);
+    if metadata.len() > limit {
+        return Err(error(path, "too large to be an aiips sketch"));
+    }
+    bytes.reserve(metadata.len().saturating_sub(bytes.len() as u64) as usize);
+    file.take(limit.saturating_add(1).saturating_sub(bytes.len() as u64))
+        .read_to_end(&mut bytes)
+        .map_err(|e| error(path, e))?;
+    if bytes.len() as u64 > limit {
         return Err(error(path, "too large to be an aiips sketch"));
     }
     sketch_format::parse(&bytes).map_err(|e| error(path, e))
@@ -68,69 +75,68 @@ fn classify(path: &Path) -> Result<CompareInput, String> {
     }
 }
 
-/// Builds both comparison sketches. Sequence inputs take the parameters of a
-/// minhash sketch input (an explicit `-k` must match it), or the defaults.
-fn compare_sketches(paths: &[PathBuf; 2], k: Option<NonZeroUsize>) -> Result<[Sketch; 2], String> {
+fn unsupported_pair(paths: &[PathBuf; 2], kinds: [&str; 2]) -> String {
+    format!(
+        "comparison requires two sketches of one algorithm, minhash or fracminhash ({}: {}, {}: {})",
+        paths[0].display(),
+        kinds[0],
+        paths[1].display(),
+        kinds[1]
+    )
+}
+
+/// Builds both comparison sketches. Sequence inputs take the algorithm and
+/// parameters of a sketch input (given options must match it), or the options
+/// and defaults when both inputs are sequences.
+fn compare_sketches(
+    paths: &[PathBuf; 2],
+    options: &AlgorithmOptions,
+) -> Result<[Sketch; 2], String> {
     let inputs = [classify(&paths[0])?, classify(&paths[1])?];
     let kind = |input: &CompareInput| match input {
         CompareInput::Sketch(sketch) => sketch.algorithm().name(),
         CompareInput::Sequence => "fasta/fastq",
     };
     if inputs.iter().any(
-        |input| matches!(input, CompareInput::Sketch(sketch) if !matches!(sketch, Sketch::MinHash(_))),
+        |input| matches!(input, CompareInput::Sketch(sketch) if !sketch.algorithm().is_implemented()),
     ) {
-        return Err(format!(
-            "comparison requires two minhash sketches ({}: {}, {}: {})",
-            paths[0].display(),
-            kind(&inputs[0]),
-            paths[1].display(),
-            kind(&inputs[1])
-        ));
+        return Err(unsupported_pair(paths, [kind(&inputs[0]), kind(&inputs[1])]));
     }
     let template = paths
         .iter()
         .zip(&inputs)
         .find_map(|(path, input)| match input {
-            CompareInput::Sketch(Sketch::MinHash(sketch)) => Some((path, &sketch.params)),
-            _ => None,
+            CompareInput::Sketch(sketch) => SketchParams::of(sketch).map(|p| (path, p)),
+            CompareInput::Sequence => None,
         });
     let params = match template {
-        Some((path, params)) => {
-            if let Some(k) = k.filter(|k| *k != params.k) {
-                return Err(format!(
-                    "-k {k} does not match k={} recorded in {}",
-                    params.k,
-                    path.display()
-                ));
-            }
-            params.clone()
-        }
-        None => MinHashParams::new(
-            k.unwrap_or(NonZeroUsize::new(minhash::DEFAULT_K).unwrap()),
-            minhash::DEFAULT_NUM_HASHES,
-            minhash::DEFAULT_SEED,
-        )?,
+        Some((path, template)) => options.matching(&template, path)?,
+        None => options.params()?,
     };
     let mut sketches = Vec::with_capacity(2);
     for (path, input) in paths.iter().zip(inputs) {
         sketches.push(match input {
             CompareInput::Sketch(sketch) => sketch,
-            CompareInput::Sequence => Sketch::MinHash(sketch_sequence(path, params.clone())?),
+            CompareInput::Sequence => sketch_sequence(path, params.clone())?,
         });
     }
     Ok(sketches.try_into().unwrap())
 }
 
-fn sketch_sequence(path: &Path, params: MinHashParams) -> Result<MinHashSketch, String> {
+fn sketch_sequence(path: &Path, params: SketchParams) -> Result<Sketch, String> {
     let (file, _) = open_input(path)?;
     sketch_file(path, file, params)
 }
 
 /// Sketches an already-opened FASTA/FASTQ file; refuses inputs without k-mers.
-fn sketch_file(path: &Path, file: File, params: MinHashParams) -> Result<MinHashSketch, String> {
-    let k = params.k;
-    let sketch = MinHashSketch::build(file, params).map_err(|e| error(path, e))?;
-    if sketch.summary.kmers == 0 {
+fn sketch_file(path: &Path, file: File, params: SketchParams) -> Result<Sketch, String> {
+    let k = params.k();
+    let sketch = match params {
+        SketchParams::MinHash(p) => MinHashSketch::build(file, p).map(Sketch::MinHash),
+        SketchParams::FracMinHash(p) => FracMinHashSketch::build(file, p).map(Sketch::FracMinHash),
+    }
+    .map_err(|e| error(path, e))?;
+    if sketch.summary().is_some_and(|summary| summary.kmers == 0) {
         return Err(error(
             path,
             format!("no valid k-mers of length {k}; nothing to sketch"),
@@ -139,33 +145,49 @@ fn sketch_file(path: &Path, file: File, params: MinHashParams) -> Result<MinHash
     Ok(sketch)
 }
 
-/// Halts unless both inputs are minhash sketches with identical parameters.
-fn minhash_pair<'a>(
-    paths: &[PathBuf; 2],
-    sketches: &'a [Sketch; 2],
-) -> Result<[&'a MinHashSketch; 2], String> {
+/// Estimates for two sketches of one algorithm with identical parameters;
+/// halts otherwise, naming each input's type or every differing field.
+fn estimate_pair(paths: &[PathBuf; 2], sketches: &[Sketch; 2]) -> Result<Estimates, String> {
+    let differ = |differences: Vec<String>| {
+        format!(
+            "{} and {}: sketch parameters differ: {}; re-sketch with identical parameters",
+            paths[0].display(),
+            paths[1].display(),
+            differences.join(", ")
+        )
+    };
     match sketches {
         [Sketch::MinHash(a), Sketch::MinHash(b)] => {
             let differences = a.params.mismatches(&b.params);
-            if differences.is_empty() {
-                Ok([a, b])
-            } else {
-                Err(format!(
-                    "{} and {}: sketch parameters differ: {}; re-sketch with identical parameters",
-                    paths[0].display(),
-                    paths[1].display(),
-                    differences.join(", ")
-                ))
+            if !differences.is_empty() {
+                return Err(differ(differences));
             }
+            minhash::estimate(a, b)
         }
-        [a, b] => Err(format!(
-            "comparison requires two minhash sketches ({}: {}, {}: {})",
-            paths[0].display(),
-            a.algorithm().name(),
-            paths[1].display(),
-            b.algorithm().name()
+        [Sketch::FracMinHash(a), Sketch::FracMinHash(b)] => {
+            let differences = a.params.mismatches(&b.params);
+            if !differences.is_empty() {
+                return Err(differ(differences));
+            }
+            if let Some(path) = paths
+                .iter()
+                .zip([a, b])
+                .find_map(|(path, s)| s.hashes.is_empty().then_some(path))
+            {
+                return Err(error(path, fracminhash::EMPTY));
+            }
+            fracminhash::estimate(a, b)
+        }
+        [a, b] => Err(unsupported_pair(
+            paths,
+            [a.algorithm().name(), b.algorithm().name()],
         )),
     }
+}
+
+fn summary_row<'a>(path: &'a Path, sketch: &'a Sketch) -> (&'a Path, &'a Summary, NonZeroUsize) {
+    // Only implemented sketches reach reporting.
+    (path, sketch.summary().unwrap(), sketch.k().unwrap())
 }
 
 #[cfg(unix)]
@@ -463,23 +485,21 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
         Command::Sketch {
             input,
             output: destination,
-            params: SketchParams::MinHash(params),
+            params,
             force,
         } => {
             let (file, metadata) = open_input(&input)?;
             preflight_output(&input, &metadata, &destination, force)?;
             let sketch = sketch_file(&input, file, params)?;
-            let k = sketch.params.k;
-            let mut transaction = OutputTransaction::install(
-                &input,
-                &metadata,
-                &destination,
-                force,
-                &sketch.to_bytes(),
-            )?;
-            let summary = sketch.summary;
+            let bytes = match &sketch {
+                Sketch::MinHash(s) => s.to_bytes(),
+                Sketch::FracMinHash(s) => s.to_bytes(),
+                Sketch::Unsupported(_) => unreachable!("only implemented sketches are built"),
+            };
+            let mut transaction =
+                OutputTransaction::install(&input, &metadata, &destination, force, &bytes)?;
             let report = (|| -> io::Result<()> {
-                report::statistics(output, &[(&input, &summary, k)])?;
+                report::statistics(output, &[summary_row(&input, &sketch)])?;
                 writeln!(output, "output\t{}", report::label(&destination))?;
                 output.flush()
             })();
@@ -489,17 +509,30 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
             if let Some(warning) = transaction.finish() {
                 eprintln!("aiips: warning: {warning}");
             }
+            if let Sketch::FracMinHash(s) = &sketch {
+                if s.hashes.is_empty() {
+                    eprintln!(
+                        "aiips: warning: {}",
+                        error(
+                            &destination,
+                            format!(
+                                "no k-mer hash is at or below the scaled={} threshold; the sketch is empty and cannot be compared",
+                                s.params.scaled
+                            )
+                        )
+                    );
+                }
+            }
             Ok(())
         }
-        Command::Compare { inputs, k } => {
-            let sketches = compare_sketches(&inputs, k)?;
-            let [a, b] = minhash_pair(&inputs, &sketches)?;
-            let estimates = minhash::estimate(a, b)?;
+        Command::Compare { inputs, options } => {
+            let sketches = compare_sketches(&inputs, &options)?;
+            let estimates = estimate_pair(&inputs, &sketches)?;
             report::statistics(
                 output,
                 &[
-                    (&inputs[0], &a.summary, a.params.k),
-                    (&inputs[1], &b.summary, b.params.k),
+                    summary_row(&inputs[0], &sketches[0]),
+                    summary_row(&inputs[1], &sketches[1]),
                 ],
             )
             .map_err(|e| format!("stdout: {e}"))?;
@@ -514,8 +547,8 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
 mod tests {
     use super::*;
     use crate::test_support::TestDirectory;
+    use aiips::sketch::fracminhash::FracMinHashParams;
     use aiips::sketch::minhash::MinHashParams;
-    use std::num::NonZeroUsize;
 
     fn params(k: usize) -> MinHashParams {
         MinHashParams::new(NonZeroUsize::new(k).unwrap(), 16, 42).unwrap()
@@ -670,7 +703,7 @@ mod tests {
             let result = execute(
                 Command::Compare {
                     inputs: [input.clone(), input.clone()],
-                    k: None,
+                    options: AlgorithmOptions::default(),
                 },
                 &mut FailingWriter { flush_only },
             );
@@ -707,7 +740,7 @@ mod tests {
         let result = execute(
             Command::Compare {
                 inputs: [input.clone(), input],
-                k: None,
+                options: AlgorithmOptions::default(),
             },
             &mut LimitedWriter(statistics.len()),
         );
@@ -799,28 +832,58 @@ mod tests {
     }
 
     #[test]
-    fn compare_halts_unless_both_sketches_are_minhash() {
+    fn compare_halts_unless_both_sketches_share_an_implemented_algorithm() {
         let directory = TestDirectory::new();
         let minhash = directory.join("m.aiips");
         let other = directory.join("o.aiips");
+        let frac = directory.join("f.aiips");
         write_sketch(&minhash, b">a\nACGTACGT\n", 3);
+        fs::write(&other, b"aiips-sketch v1 algorithm=bottomk\n").unwrap();
+        let p = FracMinHashParams::new(NonZeroUsize::new(3).unwrap(), 1, 42).unwrap();
         fs::write(
-            &other,
-            b"aiips-sketch v1 algorithm=fracminhash scaled=1000\n",
+            &frac,
+            FracMinHashSketch::build(b">a\nACGTACGT\n".as_slice(), p)
+                .unwrap()
+                .to_bytes(),
         )
         .unwrap();
+        for (inputs, names) in [
+            ([minhash.clone(), frac.clone()], "minhash, "),
+            ([frac.clone(), minhash.clone()], "fracminhash, "),
+            ([frac.clone(), other.clone()], "bottomk)"),
+        ] {
+            let mut stdout = Vec::new();
+            let error = execute(
+                Command::Compare {
+                    inputs,
+                    options: AlgorithmOptions::default(),
+                },
+                &mut stdout,
+            )
+            .unwrap_err();
+            assert!(error.contains("two sketches of one algorithm"), "{error}");
+            assert!(error.contains(names), "{error}");
+            assert!(stdout.is_empty());
+        }
         for inputs in [
             [minhash.clone(), other.clone()],
             [other.clone(), minhash.clone()],
             [other.clone(), other.clone()],
         ] {
             let mut stdout = Vec::new();
-            let error = execute(Command::Compare { inputs, k: None }, &mut stdout).unwrap_err();
+            let error = execute(
+                Command::Compare {
+                    inputs,
+                    options: AlgorithmOptions::default(),
+                },
+                &mut stdout,
+            )
+            .unwrap_err();
             assert!(
-                error.contains("comparison requires two minhash sketches"),
+                error.contains("comparison requires two sketches of one algorithm"),
                 "{error}"
             );
-            assert!(error.contains("fracminhash"), "{error}");
+            assert!(error.contains("bottomk"), "{error}");
             assert!(stdout.is_empty());
         }
     }
@@ -836,7 +899,7 @@ mod tests {
         let error = execute(
             Command::Compare {
                 inputs: [a, b],
-                k: None,
+                options: AlgorithmOptions::default(),
             },
             &mut stdout,
         )
@@ -853,9 +916,75 @@ mod tests {
         let directory = TestDirectory::new();
         let big = directory.join("big.aiips");
         let file = File::create(&big).unwrap();
-        file.set_len(MAX_SKETCH_BYTES + 1).unwrap();
+        file.set_len(sketch_format::max_file_bytes(b"") + 1)
+            .unwrap();
         let error = read_sketch(&big).unwrap_err();
         assert!(error.contains("too large"), "{error}");
+    }
+
+    #[test]
+    fn fracminhash_files_are_bounded_by_their_declared_size() {
+        let directory = TestDirectory::new();
+        let path = directory.join("f.aiips");
+        let header =
+            b"aiips-sketch v1 algorithm=fracminhash k=3 scaled=1 seed=42 hash=murmur3-fmix64 canonical=true size=0\n";
+        let mut bytes = header.to_vec();
+        bytes.resize(sketch_format::HEADER_BYTES as usize + 1, b'0');
+        fs::write(&path, &bytes).unwrap();
+        assert!(read_sketch(&path).unwrap_err().contains("too large"));
+        // A large declared size admits a file above the MinHash bound.
+        let size = minhash::MAX_NUM_HASHES as u64 + 1000;
+        let p = FracMinHashParams::new(NonZeroUsize::new(3).unwrap(), 1, 42).unwrap();
+        let sketch = FracMinHashSketch {
+            params: p,
+            summary: Summary {
+                records: 1,
+                bases: 10,
+                non_acgt_bases: 0,
+                kmers: 8,
+            },
+            hashes: (0..size).map(|i| u64::MAX - size + i).collect(),
+        };
+        let bytes = sketch.to_bytes();
+        assert!(bytes.len() as u64 > sketch_format::max_file_bytes(b""));
+        fs::write(&path, &bytes).unwrap();
+        match read_sketch(&path).unwrap() {
+            Sketch::FracMinHash(parsed) => assert_eq!(parsed, sketch),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn compare_halts_on_an_empty_fracminhash_sketch() {
+        let directory = TestDirectory::new();
+        let empty = directory.join("e.aiips");
+        let full = directory.join("f.aiips");
+        let build = |scaled| {
+            let p = FracMinHashParams::new(NonZeroUsize::new(3).unwrap(), scaled, 42).unwrap();
+            FracMinHashSketch::build(b">a\nACGTAC\n".as_slice(), p).unwrap()
+        };
+        let mut nonempty = build(u64::MAX);
+        assert!(nonempty.hashes.is_empty());
+        fs::write(&empty, nonempty.to_bytes()).unwrap();
+        nonempty.hashes = vec![0];
+        fs::write(&full, nonempty.to_bytes()).unwrap();
+        for inputs in [[empty.clone(), full.clone()], [full.clone(), empty.clone()]] {
+            let mut stdout = Vec::new();
+            let error = execute(
+                Command::Compare {
+                    inputs,
+                    options: AlgorithmOptions::default(),
+                },
+                &mut stdout,
+            )
+            .unwrap_err();
+            assert!(
+                error.starts_with(&format!("{}: ", empty.display())),
+                "{error}"
+            );
+            assert!(error.contains(fracminhash::EMPTY), "{error}");
+            assert!(stdout.is_empty());
+        }
     }
 
     #[test]

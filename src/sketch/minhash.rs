@@ -8,6 +8,7 @@
 use std::io::Read;
 use std::num::NonZeroUsize;
 
+pub use super::Estimates;
 use super::{invalid, parse_u64, Fields, ParseError};
 use crate::fastx::{summarize_with, Summary};
 use crate::hash::{fmix64, SplitMix64};
@@ -270,18 +271,6 @@ impl MinHashSketch {
             mins,
         })
     }
-}
-
-/// Point estimates for one sketch pair. AF is not estimable from a global
-/// MinHash (positions are discarded), so it is not part of this result.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Estimates {
-    pub jaccard: f64,
-    pub containment_a_in_b: f64,
-    pub containment_b_in_a: f64,
-    pub ani: f64,
-    pub ani_containment_a_in_b: f64,
-    pub ani_containment_b_in_a: f64,
 }
 
 /// Compares two sketches built with identical parameters.

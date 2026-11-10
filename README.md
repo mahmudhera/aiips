@@ -4,9 +4,9 @@
 ## Summary
 
 AIIPS means Anchor Indexed Island Probe Sketching. This project explores nested
-sketching. Currently, the CLI builds classic MinHash sketches of FASTA/FASTQ files
-and compares two sketches, estimating Jaccard, containment, and ANI. Other sketch
-algorithms (fracminhash, bottomk, minimizer, open-syncmer, closed-syncmer,
+sketching. Currently, the CLI builds classic MinHash or FracMinHash sketches of
+FASTA/FASTQ files and compares two sketches, estimating Jaccard, containment, and
+ANI. Other sketch algorithms (bottomk, minimizer, open-syncmer, closed-syncmer,
 strobemer) are reserved names, not yet implemented.
 
 ## Build
@@ -34,6 +34,9 @@ in `Cargo.lock`.
 ./target/release/aiips sketch tests/fixtures/sample.fa -a minhash -k 3 -o sample
 ./target/release/aiips sketch tests/fixtures/sample.fq.gz -a minhash -k 3 -o reads
 ./target/release/aiips compare sample.aiips reads.aiips
+
+./target/release/aiips sketch data/phiX174_NC_001422.1.fasta -a fracminhash --scaled 10 -o phix_frac
+./target/release/aiips compare phix_frac.aiips data/phiX174_NC_001422.1.fasta
 ```
 
 The previous `aiips INPUT...` interface has been removed. A subcommand is required.
@@ -44,17 +47,21 @@ pass an explicit relative path, such as `-o ./-sample`.
 ### Create a sketch
 
 ```text
-aiips sketch INPUT -o OUTPUT [-a ALGORITHM] [-k LENGTH] [-s NUM] [--seed SEED] [-f]
+aiips sketch INPUT -o OUTPUT [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED] [-f]
 ```
 
-`-a`/`--algorithm` defaults to `minhash`, the only implemented algorithm, so
-commands without it keep working.
-Reserved names (fracminhash, bottomk, minimizer, open-syncmer, closed-syncmer,
-strobemer) are refused as "not implemented yet"; other names are unknown. MinHash
-options: `-k` from 1 to 32 (default 21), `-s`/`--num-hashes` from 2 to 1,000,000
-(default 1000), and `--seed`, any unsigned 64-bit integer (default 42). Each option
-may be given once. An input without any valid k-mer is refused and creates no
-output.
+`-a`/`--algorithm` is `minhash` (the default, so commands without it keep
+working) or `fracminhash`.
+Reserved names (bottomk, minimizer, open-syncmer, closed-syncmer, strobemer) are
+refused as "not implemented yet"; other names are unknown. Both algorithms take
+`-k` from 1 to 32 (default 21) and `--seed`, any unsigned 64-bit integer (default
+42). MinHash also takes `-s`/`--num-hashes` from 2 to 1,000,000 (default 1000);
+FracMinHash takes `--scaled`, an integer scale factor from 1 to 2^64 - 1 (default
+1000). Options that do not apply to the chosen algorithm (`--scaled` with
+MinHash, `-s` with FracMinHash) are errors. Each option may be given once. An
+input without any valid k-mer is refused and creates no output. A FracMinHash
+sketch that keeps no hash value is still written, with a warning on stderr,
+because it is a valid sample; it cannot be compared.
 
 Accepts exactly one plain or gzip-compressed FASTA/FASTQ file, detected by content.
 `-o`/`--output` is required. `.aiips` is appended unless that extension is already
@@ -107,8 +114,9 @@ Examples show tab characters as `\t` for readability.
 ### Sketch format
 
 `.aiips` files are text. Line 1 names the format, version, sketch type, and every
-parameter; line 2 records the input statistics; then come the `num_hashes` minima,
-one decimal value per line, in hash-function order:
+parameter; line 2 records the input statistics; then come the hash values, one
+decimal value per line. A MinHash sketch holds its `num_hashes` minima in
+hash-function order:
 
 ```text
 aiips-sketch v1 algorithm=minhash k=3 num_hashes=1000 seed=42 hash=murmur3-fmix64 canonical=true
@@ -117,9 +125,21 @@ records=2 bases=13 non_acgt_bases=2 valid_kmers=7
 ...
 ```
 
+A FracMinHash sketch holds its `size` retained hash values in strictly increasing
+order. `size` is the number of values, not a comparison parameter:
+
+```text
+aiips-sketch v1 algorithm=fracminhash k=3 scaled=1 seed=42 hash=murmur3-fmix64 canonical=true size=3
+records=2 bases=13 non_acgt_bases=2 valid_kmers=7
+<smallest retained hash value>
+...
+```
+
 Reading is strict: unknown, missing, or duplicate fields, a wrong value count,
-non-decimal values, carriage returns, a missing final newline, or another version
-are errors. Zero-byte files written by earlier placeholder versions are rejected
+non-decimal values, FracMinHash values out of order, repeated, or above the
+`scaled` threshold, carriage returns, a missing final newline, or another version
+are errors. A FracMinHash file may not exceed 21 bytes per declared value plus
+4096 bytes; every other sketch file is bounded by the largest MinHash sketch. Zero-byte files written by earlier placeholder versions are rejected
 with a hint to re-run `aiips sketch`.
 
 ### MinHash
@@ -137,10 +157,29 @@ being independently sampled, and no approximation-error bound is established for
 this family; it is a practical heuristic. Sketching costs `s` hash evaluations per k-mer and uses
 O(`s`) memory; sequences are never stored.
 
+### FracMinHash
+
+FracMinHash (Irber et al. 2022; Hera, Pierce-Ward & Koslicki 2023) keeps every
+distinct canonical k-mer whose hash is at most `max_hash = floor((2^64 - 1) / S)`
+for scale factor `S` (`--scaled`), the convention used by sourmash. The hash is
+`fmix64(kmer XOR seed_0)`, MinHash's hash function 0 for the same `--seed`, so the
+hash-family caveats above apply. In the ideal model of uniformly random hash
+values a k-mer is kept with probability `(max_hash + 1) / 2^64`. This is exactly
+`1/S` when `S` is a power of two and otherwise within `2^-64` of `1/S`. `S = 1`
+keeps every distinct k-mer, so estimates are then exact set statistics. In that
+model the sketch size `|FRAC(A)|` is Binomial(`|A|`, about `1/S`), so
+`S · |FRAC(A)|` estimates the number of distinct k-mers `|A|`, with standard
+deviation `sqrt(|A|(S - 1))`.
+
+Sketching costs one hash evaluation per k-mer. Retained hashes are buffered and
+compacted (sorted, deduplicated) whenever the buffer doubles, so memory is
+proportional to the number of distinct retained hashes, about `|A| / S`;
+sequences are never stored.
+
 ### Compare two inputs
 
 ```text
-aiips compare INPUT_A INPUT_B [-k LENGTH]
+aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED]
 ```
 
 Each input is a sketch or a plain/gzip FASTA/FASTQ file; mixed pairs are
@@ -148,14 +187,20 @@ supported, so commands written before sketches existed keep working. Files named
 `.aiips` (case-insensitive) must be sketches; other files are sketches when they
 start with the sketch header and are otherwise read as sequence.
 
-Sequence inputs are sketched in memory with MinHash. When the other input is a
-MinHash sketch, its parameters are used and a given `-k` must equal its `k`.
-Otherwise `k` comes from `-k` (default 21) with the default 1000 hash functions
-and seed 42. A sequence input without valid k-mers is an error.
+Sequence inputs are sketched in memory. When an input is a sketch, its algorithm
+and parameters are used, and every given option must equal the recorded value
+(`-a` its algorithm, `-k` its `k`, `-s` its `num_hashes`, `--scaled` its
+`scaled`, `--seed` its `seed`); options that do not apply to its algorithm are
+errors. These checks also apply when both inputs are sketches. When both inputs
+are sequences, the algorithm comes from `-a` (default `minhash`) and the
+parameters from the options, with the `sketch` defaults. A sequence input without
+valid k-mers is an error.
 
-Unless every sketch input is MinHash, `compare` halts and names each input's type.
-Two MinHash sketches must agree in `k`, `num_hashes`, `seed`, `hash`, and
-`canonical`; every differing field is reported.
+Unless both inputs are MinHash or both are FracMinHash, `compare` halts and names
+each input's type. Two MinHash sketches must agree in `k`, `num_hashes`, `seed`,
+`hash`, and `canonical`; two FracMinHash sketches in `k`, `scaled`, `seed`, `hash`,
+and `canonical`. Every differing field is reported. An empty FracMinHash sketch
+halts the comparison, because its containment is undefined.
 
 Output contains a statistics table, a blank line, and a
 comparison table:
@@ -169,7 +214,7 @@ input_a\tinput_b\tjaccard\tcontainment_a_in_b\tcontainment_b_in_a\tani\taf_a_to_
 sample.aiips\treads.aiips\t1.000000\t1.000000\t1.000000\t1.000000\t-1\t-1\t1.000000\t1.000000
 ```
 
-Estimators, with `s` hash functions and minima `a_i`, `b_i`. Their stated
+MinHash estimators, with `s` hash functions and minima `a_i`, `b_i`. Their stated
 properties hold in the ideal model of independent, uniformly random hash
 functions; the seeded fmix64 family above only approximates that model.
 
@@ -196,12 +241,47 @@ functions; the seeded fmix64 family above only approximates that model.
   mutation model containment is about `AF · q^k`, so one containment value cannot
   separate AF from identity `q`.
 
-Values are printed with six decimals. In the ideal model, estimates have sampling
-error of roughly `sqrt(J(1 - J)/s)` for Jaccard and `1/sqrt(s)` relative error for
-the counts. These figures omit any bias or dependence from the hash family. The
-tests confirm accuracy on their fixed cases (known sets, phiX174 mutated at known
-rates), not hash-family independence or an error bound.
-`compare` does not accept `-o`, `--force`, or sketch options.
+FracMinHash estimators, with retained sets `FRAC(A)` and `FRAC(B)`:
+
+- `jaccard`: `|FRAC(A) ∩ FRAC(B)| / |FRAC(A) ∪ FRAC(B)|`. The union of the
+  retained sets is the retained set of the union, so this is a ratio of sampled
+  counts.
+- `containment_a_in_b`: `|FRAC(A) ∩ FRAC(B)| / |FRAC(A)|`, the raw ratio,
+  reported only when both sketches are non-empty. Its bias depends on how empty
+  sketches are treated. In the ideal model where each distinct k-mer is kept
+  independently with probability `q ≈ 1/S`:
+  - Hera, Pierce-Ward & Koslicki (2023) score an empty `FRAC(A)` as 0. The
+    expectation is then `C · (1 - (1 - q)^|A|)`, and they divide by that factor to
+    remove the bias. aiips does neither.
+  - Given a non-empty `FRAC(A)`, the raw ratio is unbiased: given its size `m`,
+    the kept part of A is a uniform `m`-subset, so the shared count has mean
+    `m · C`.
+  - aiips also refuses an empty `FRAC(B)`. An empty `FRAC(B)` would give ratio 0,
+    so the reported value has expectation `C / P(FRAC(B) ≠ ∅ | FRAC(A) ≠ ∅)`. That
+    is at least `C` and at most `C / (1 - (1 - q)^|B|)`, because the two
+    non-emptiness events are positively correlated (Harris inequality). So the reported
+    containment is biased upward, not downward. For example, with A = {x, y},
+    B = {x, z}, `q = 1/2` and true containment 0.5, the three policies average
+    0.375, 0.5 and 0.6.
+
+  The last two statements are derived here, not taken from the paper. The tests
+  check all three by exhaustive enumeration. The bias is negligible unless an
+  expected sketch size (`|A|/S` or `|B|/S`) is small. Real hash functions only
+  approximate the model.
+- `ani` and `ani_containment_*`: the MinHash transforms above, Mash ANI from
+  `jaccard` and `C^(1/k)` from each containment. The containment-ANI model and
+  caveats above apply; the paper's guarantees and confidence intervals are for its
+  debiased containment, not this raw ratio.
+- `af_a_to_b`, `af_b_to_a`: always `-1`, as for MinHash: FracMinHash keeps no
+  positions.
+
+Values are printed with six decimals. In the ideal model, MinHash estimates have
+sampling error of roughly `sqrt(J(1 - J)/s)` for Jaccard and `1/sqrt(s)` relative
+error for the counts, and FracMinHash containment roughly `sqrt(C(1 - C)/(|A|/S))`.
+These figures are approximations that omit any bias or dependence from the hash
+family. The tests confirm accuracy on their fixed cases (known sets, phiX174
+mutated at known rates), not hash-family independence or an error bound.
+`compare` does not accept `-o` or `--force`.
 
 ### Shared behavior
 
@@ -231,14 +311,16 @@ Command-specific help takes precedence over invalid arguments anywhere before
   without per-k-mer allocation, and rolling canonical 2-bit k-mer codes for
   k <= 32. Both take O(sequence length) time and O(1) extra space.
 - `src/hash.rs` provides MurmurHash3's fmix64 and SplitMix64.
-- `src/sketch/` holds the algorithm registry and `.aiips` format (`mod.rs`) and
-  MinHash construction and estimators (`minhash.rs`).
+- `src/sketch/` holds the algorithm registry and `.aiips` format (`mod.rs`),
+  MinHash construction and estimators (`minhash.rs`), and FracMinHash
+  construction and estimators (`fracminhash.rs`). FracMinHash comparison merges
+  the two sorted sketches in linear time.
 - The binary separates argument parsing, command execution and output handling,
   and TSV formatting. Memory scales with parser buffering and the largest record.
 
-Sketch algorithms other than MinHash, AF estimation, k > 32, confidence intervals,
-quality filtering, parallel processing, and compression other than gzip remain
-unimplemented.
+Sketch algorithms other than MinHash and FracMinHash, debiased FracMinHash
+containment, AF estimation, k > 32, confidence intervals, quality filtering,
+parallel processing, and compression other than gzip remain unimplemented.
 
 ## Tests
 
@@ -276,12 +358,16 @@ cargo llvm-cov --locked --ignore-filename-regex '(^|/)tests/'
 ```
 
 The library tests compare forward and canonical k-mer iteration with exhaustive
-naive baselines, and streamed MinHash sketches with a brute-force baseline over the
-distinct k-mer set. Estimators are checked against exact cases (identical,
-disjoint, and reverse-complement inputs), hand-computed formula values, synthetic
-sets with known Jaccard, containment, and cardinality (within 4 standard errors,
-fixed seeds), and the phiX174 genome in `data/` mutated in memory at known
-substitution rates (1% and 5%), where containment ANI recovers 1 - p within 0.008.
+naive baselines, and streamed MinHash and FracMinHash sketches with brute-force
+baselines over the distinct k-mer set (for FracMinHash across several scale
+factors, including inputs large enough to exercise buffer compaction).
+Estimators are checked against exact cases (identical, disjoint, and
+reverse-complement inputs, and exact set statistics at `--scaled 1`),
+hand-computed formula values, synthetic sets with known Jaccard, containment, and
+cardinality (within 4 standard errors, fixed seeds), and the phiX174 genome in
+`data/` mutated in memory at known substitution rates (1% and 5%). There,
+containment ANI recovers 1 - p within 0.008 for MinHash and for FracMinHash at
+`--scaled` 1 and 10.
 SplitMix64 is checked against its published reference outputs, fmix64 by
 inversion.
 Integration tests exercise each command, all input combinations, gzip, known

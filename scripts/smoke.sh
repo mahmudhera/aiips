@@ -119,6 +119,33 @@ expect_error "sketch refuses reserved algorithm" "bottomk is not implemented yet
     sketch "$fa" -a bottomk -k 3 -o missing
 [ ! -e missing.aiips ] || fail "refused sketch created missing.aiips"
 
+# FracMinHash: scaled=1 keeps every distinct k-mer of the tiny fixtures.
+frac_header='aiips-sketch v1 algorithm=fracminhash k=3 scaled=1 seed=42 hash=murmur3-fmix64 canonical=true size='
+expect_stdout "sketch fracminhash fasta" \
+    "$stats"$'\n'"$fa"$'\t'"$counts"$'\noutput\tfrac.aiips' \
+    sketch "$fa" -a fracminhash -k 3 --scaled 1 -o frac
+[[ "$(head -n 1 frac.aiips)" == "$frac_header"* ]] ||
+    fail "fracminhash sketch: unexpected header: $(head -n 1 frac.aiips)"
+size=$(head -n 1 frac.aiips)
+size=${size##*size=}
+[ "$(wc -l <frac.aiips | tr -d ' ')" -eq $((size + 2)) ] ||
+    fail "fracminhash sketch: expected $((size + 2)) lines (2 header lines + size values)"
+expect_stdout "sketch fracminhash gzip fastq" \
+    "$stats"$'\n'"$fq"$'\t'"$counts"$'\noutput\tfracreads.aiips' \
+    sketch "$fq" -a fracminhash -k 3 --scaled 1 -o fracreads
+cmp -s frac.aiips fracreads.aiips || fail "fasta and gzip fastq fracminhash sketches differ"
+expect_stdout "compare identical fracminhash sketches" \
+    "$stats"$'\nfrac.aiips\t'"$counts"$'\nfracreads.aiips\t'"$counts"$'\n\n'"$metrics"$'\nfrac.aiips\tfracreads.aiips\t'"$ones" \
+    compare frac.aiips fracreads.aiips
+expect_stdout "compare fasta vs gzip fastq with fracminhash" \
+    "$stats"$'\n'"$fa"$'\t'"$counts"$'\n'"$fq"$'\t'"$counts"$'\n\n'"$metrics"$'\n'"$fa"$'\t'"$fq"$'\t'"$ones" \
+    compare "$fa" "$fq" -a fracminhash -k 3 --scaled 1
+expect_error "compare refuses mixed algorithms" "(sample.aiips: minhash, frac.aiips: fracminhash)" \
+    compare sample.aiips frac.aiips
+expect_error "sketch refuses --scaled with minhash" "--scaled applies only to fracminhash" \
+    sketch "$fa" -a minhash -k 3 --scaled 10 -o missing
+[ ! -e missing.aiips ] || fail "refused sketch created missing.aiips"
+
 before=$(cat sample.aiips)
 expect_error "sketch refuses existing output" "use -f or --force" \
     sketch "$fa" -a minhash -k 3 -o sample
