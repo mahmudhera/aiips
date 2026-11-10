@@ -33,23 +33,25 @@ Matrix (`fail-fast: false`, so every platform reports its own result):
    `#[cfg(windows)]` run only on their target OS, which is expected.
 4. Subcommand smoke tests on every platform, in `scripts/smoke.sh BINARY`. The script
    copies the committed fixtures into a temporary work directory as
-   `tests/fixtures/`, runs from there, and passes only relative `/`-separated paths,
-   so printed labels are the same on every platform:
+   `tests/fixtures/`, runs from there, and passes only relative `/`-separated
+   paths. The sketch output has no parent directory, because appending `.aiips`
+   to a parented path inserts the platform separator. Printed labels are
+   therefore the same on every platform:
    - `aiips --help`, `aiips sketch --help` and `aiips compare --help` exit 0.
-   - `aiips sketch tests/fixtures/sample.fa -k 3 -o out/sample` exits 0. Its stdout
+   - `aiips sketch tests/fixtures/sample.fa -k 3 -o sample` exits 0. Its stdout
      is exactly:
      ```
      input	records	bases	non_acgt_bases	k	valid_kmers
      tests/fixtures/sample.fa	2	13	2	3	7
-     output	out/sample.aiips
+     output	sample.aiips
      ```
-     It also creates an empty file `out/sample.aiips`. The counts are the known
+     It also creates an empty file `sample.aiips`. The counts are the known
      baseline from `tests/cli.rs` (`sketch_format!`).
    - `aiips compare tests/fixtures/sample.fa tests/fixtures/sample.fq.gz -k 3` exits 0.
      Both statistics rows show `2	13	2	3	7`, and all six metric values are `-1`.
-   - `aiips compare out/sample.aiips tests/fixtures/sample.fa -k 3` exits 0. This is
+   - `aiips compare sample.aiips tests/fixtures/sample.fa -k 3` exits 0. This is
      the sketch round trip, and the statistics row for the sketch is `NA` throughout.
-   - Re-running the same `sketch` without `-f` exits 1, leaves `out/sample.aiips`
+   - Re-running the same `sketch` without `-f` exits 1, leaves `sample.aiips`
      unchanged, and prints an error that suggests `-f`.
    - An unknown command, such as `aiips bogus`, exits 1.
    - Compare stdout exactly against the expected text, after normalizing CRLF line

@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# Smoke-tests every aiips subcommand against the committed fixtures (see SPEC.md).
+# Smoke-tests every aiips subcommand against the committed fixtures.
 # Usage: scripts/smoke.sh PATH_TO_AIIPS_BINARY
 #
 # Fixtures are copied into a temporary work directory and every path passed to the
-# binary is relative, so printed path labels are identical on every platform and
-# nothing is written into the repository tree.
+# binary is relative and /-separated, so printed path labels are identical on
+# every platform. The sketch output has no parent directory: appending .aiips to
+# a parented path would print the platform separator (escaped `\\` on Windows).
+# Nothing is written into the repository tree.
 set -euo pipefail
 
 [ $# -eq 1 ] || { echo "usage: $0 PATH_TO_AIIPS_BINARY" >&2; exit 2; }
 bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 [ -x "$bin" ] || [ -x "$bin.exe" ] || { echo "not executable: $1" >&2; exit 2; }
+[ -x "$bin" ] || bin=$bin.exe # Windows
 repo=$(cd "$(dirname "$0")/.." && pwd)
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/tests" "$work/out"
+mkdir -p "$work/tests"
 cp -R "$repo/tests/fixtures" "$work/tests/"
 cd "$work"
 errors=$(mktemp)
@@ -72,23 +75,23 @@ expect_help "sketch help" sketch --help
 expect_help "compare help" compare --help
 
 expect_stdout "sketch" \
-    "$stats"$'\n'"$fa"$'\t'"$counts"$'\noutput\tout/sample.aiips' \
-    sketch "$fa" -k 3 -o out/sample
-[ -f out/sample.aiips ] && [ ! -s out/sample.aiips ] ||
-    fail "sketch: out/sample.aiips is not an empty file"
+    "$stats"$'\n'"$fa"$'\t'"$counts"$'\noutput\tsample.aiips' \
+    sketch "$fa" -k 3 -o sample
+[ -f sample.aiips ] && [ ! -s sample.aiips ] ||
+    fail "sketch: sample.aiips is not an empty file"
 
 expect_stdout "compare fasta vs gzip fastq" \
     "$stats"$'\n'"$fa"$'\t'"$counts"$'\n'"$fq"$'\t'"$counts"$'\n\n'"$metrics"$'\n'"$fa"$'\t'"$fq"$'\t-1\t-1\t-1\t-1\t-1\t-1' \
     compare "$fa" "$fq" -k 3
 
 expect_stdout "compare sketch round trip" \
-    "$stats"$'\nout/sample.aiips\tNA\tNA\tNA\tNA\tNA\n'"$fa"$'\t'"$counts"$'\n\n'"$metrics"$'\nout/sample.aiips\t'"$fa"$'\t-1\t-1\t-1\t-1\t-1\t-1' \
-    compare out/sample.aiips "$fa" -k 3
+    "$stats"$'\nsample.aiips\tNA\tNA\tNA\tNA\tNA\n'"$fa"$'\t'"$counts"$'\n\n'"$metrics"$'\nsample.aiips\t'"$fa"$'\t-1\t-1\t-1\t-1\t-1\t-1' \
+    compare sample.aiips "$fa" -k 3
 
 expect_error "sketch refuses existing output" "use -f or --force" \
-    sketch "$fa" -k 3 -o out/sample
-[ -f out/sample.aiips ] && [ ! -s out/sample.aiips ] ||
-    fail "sketch refusal: out/sample.aiips was modified"
+    sketch "$fa" -k 3 -o sample
+[ -f sample.aiips ] && [ ! -s sample.aiips ] ||
+    fail "sketch refusal: sample.aiips was modified"
 
 expect_error "unknown command" "unknown command" bogus
 

@@ -173,7 +173,10 @@ exit codes and exact stdout.
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main`
 (and on manual dispatch) with Rust 1.99.1. On Linux, macOS (arm64) and Windows, it
 builds the release binary, runs `cargo test --locked`, and runs `scripts/smoke.sh`.
-A separate Linux job checks formatting and Clippy. See [SPEC.md](SPEC.md).
+A separate Linux job checks formatting and Clippy. Tests that rely on Unix-only
+behavior (symlinks, file identity, forced replacement, control characters in file
+names) are compiled only on Unix; Windows runs equivalent checks of the documented
+Windows behavior instead.
 
 The library tests compare k-mer iteration with an exhaustive naive baseline.
 Integration tests exercise each command, all input combinations, gzip, known

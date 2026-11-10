@@ -163,6 +163,13 @@ fn sketch_existing_output_refused_and_preserved() {
     assert_eq!(fs::read(t.path("out.aiips")).unwrap(), b"existing result");
 }
 
+/// Spells a `/`-separated relative path with the platform separator, as the CLI
+/// does when it appends `.aiips` to a path with a parent directory.
+fn native(path: &str) -> String {
+    path.split('/').collect::<PathBuf>().display().to_string()
+}
+
+#[cfg(unix)]
 #[test]
 fn sketch_force_replaces_and_cleans_staging() {
     for flag in ["-f", "--force"] {
@@ -170,6 +177,22 @@ fn sketch_force_replaces_and_cleans_staging() {
         t.write("out.aiips", b"existing result");
         t.success(&["sketch", "good.fa", "-o", "out", flag]);
         t.assert_empty("out.aiips");
+        t.assert_no_staging_files();
+    }
+}
+
+// Without Unix device/inode identity checks, forced replacement is refused.
+#[cfg(not(unix))]
+#[test]
+fn sketch_force_refuses_existing_output_without_unix_identity_checks() {
+    for flag in ["-f", "--force"] {
+        let t = Workspace::new();
+        t.write("out.aiips", b"existing result");
+        t.failure(
+            &["sketch", "good.fa", "-o", "out", flag],
+            "forced replacement requires Unix file-identity safeguards",
+        );
+        assert_eq!(fs::read(t.path("out.aiips")).unwrap(), b"existing result");
         t.assert_no_staging_files();
     }
 }
@@ -186,7 +209,13 @@ fn sketch_force_creates_new_output() {
 fn sketch_force_preserves_output_on_parse_failure() {
     let t = Workspace::new();
     t.write("out.aiips", b"existing result");
-    t.failure(&["sketch", "bad.fq", "-o", "out", "--force"], "bad.fq");
+    // Off Unix, the forced-replacement refusal precedes input parsing.
+    let expected = if cfg!(unix) {
+        "bad.fq"
+    } else {
+        "forced replacement requires Unix"
+    };
+    t.failure(&["sketch", "bad.fq", "-o", "out", "--force"], expected);
     assert_eq!(fs::read(t.path("out.aiips")).unwrap(), b"existing result");
     t.assert_no_staging_files();
 }
@@ -204,7 +233,7 @@ fn sketch_missing_destination_directory() {
     for force in [vec![], vec!["--force"]] {
         let mut args = vec!["sketch", "good.fa", "-o", "missing/out"];
         args.extend(force);
-        t.failure(&args, "missing/out.aiips");
+        t.failure(&args, &native("missing/out.aiips"));
     }
     assert!(!t.path("missing").exists());
 }
@@ -260,6 +289,32 @@ fn sketch_dangling_symlink_requires_force() {
     assert!(!t.path("missing").exists());
 }
 
+#[test]
+fn sketch_double_dash_input_beginning_with_dash() {
+    let t = Workspace::new();
+    t.write("-input.fa", b">a\nACGT\n");
+    let stdout = t.success(&["sketch", "-o", "out", "--", "-input.fa"]);
+    assert!(stdout.contains("\n-input.fa\t1\t4\t0\t21\t0\n"));
+    assert!(stdout.ends_with("output\tout.aiips\n"));
+    t.assert_empty("out.aiips");
+}
+
+#[test]
+fn sketch_output_label_with_parent_uses_native_separator() {
+    let t = Workspace::new();
+    fs::create_dir(t.path("sub")).unwrap();
+    let stdout = t.success(&["sketch", "good.fa", "-o", "sub/out"]);
+    // Labels escape backslashes, so a Windows separator prints as `\\`.
+    let label = native("sub/out.aiips").replace('\\', "\\\\");
+    assert!(stdout.ends_with(&format!("output\t{label}\n")), "{stdout}");
+    t.assert_empty("sub/out.aiips");
+    // An already-suffixed output keeps the spelling exactly as given.
+    let stdout = t.success(&["sketch", "good.fa", "-o", "sub/kept.aiips"]);
+    assert!(stdout.ends_with("output\tsub/kept.aiips\n"), "{stdout}");
+}
+
+// Control characters are invalid in Windows file names, and `\` is a separator.
+#[cfg(unix)]
 #[test]
 fn sketch_double_dash_and_escaped_paths() {
     let t = Workspace::new();
@@ -455,6 +510,17 @@ fn compare_detects_only_final_extension() {
     assert!(stdout.contains("sequence.aiips.fa\t1\t4\t0\t3\t2\n"));
 }
 
+#[test]
+fn compare_double_dash_input_beginning_with_dash() {
+    let t = Workspace::new();
+    t.write("-input.fa", b">a\nACGT\n");
+    let stdout = t.success(&["compare", "-k", "3", "--", "-input.fa", "empty.aiips"]);
+    assert!(stdout.contains("\n-input.fa\t1\t4\t0\t3\t2\n"));
+    assert!(stdout.ends_with("\n-input.fa\tempty.aiips\t-1\t-1\t-1\t-1\t-1\t-1\n"));
+}
+
+// Control characters are invalid in Windows file names, and `\` is a separator.
+#[cfg(unix)]
 #[test]
 fn compare_double_dash_and_escaped_paths() {
     let t = Workspace::new();
@@ -960,7 +1026,7 @@ fn sketch_missing_parent_is_rejected_before_parsing_invalid_input() {
     let t = Workspace::new();
     t.failure(
         &["sketch", "bad.fq", "-o", "missing/out"],
-        "missing/out.aiips",
+        &native("missing/out.aiips"),
     );
     assert!(!t.path("missing").exists());
 }
