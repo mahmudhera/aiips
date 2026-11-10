@@ -1,3 +1,5 @@
+[![CI](https://github.com/mahmudhera/aiips/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mahmudhera/aiips/actions/workflows/ci.yml)
+
 ## Summary
 
 AIIPS means Anchor Indexed Island Probe Sketching. This project explores nested
@@ -160,7 +162,18 @@ format.
 cargo test --locked
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release && scripts/smoke.sh target/release/aiips
 ```
+
+`scripts/smoke.sh` runs every subcommand against the committed fixtures and checks
+exit codes and exact stdout.
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main`
+(and on manual dispatch) with Rust 1.99.1. On Linux, macOS (arm64) and Windows, it
+builds the release binary, runs `cargo test --locked`, and runs `scripts/smoke.sh`.
+A separate Linux job checks formatting and Clippy. See [SPEC.md](SPEC.md).
 
 The library tests compare k-mer iteration with an exhaustive naive baseline.
 Integration tests exercise each command, all input combinations, gzip, known
