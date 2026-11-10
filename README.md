@@ -1,4 +1,5 @@
 [![CI](https://github.com/mahmudhera/aiips/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mahmudhera/aiips/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/mahmudhera/aiips/badges/coverage.json)](https://github.com/mahmudhera/aiips/actions/workflows/ci.yml?query=branch%3Amain)
 
 ## Summary
 
@@ -177,6 +178,19 @@ A separate Linux job checks formatting and Clippy. Tests that rely on Unix-only
 behavior (symlinks, file identity, forced replacement, control characters in file
 names) are compiled only on Unix; Windows runs equivalent checks of the documented
 Windows behavior instead.
+
+A Linux `coverage` job measures line coverage of `src/` with
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) over the full test
+suite, including the `aiips` binary launched by the integration tests. Code under
+`tests/` is excluded, but unit-test modules inside `src/` are counted. Coverage is
+reported, never enforced. Each run's summary page lists coverage by file. On `main`,
+`scripts/coverage_badge.sh` turns the result into a badge file, which is pushed to
+the `badges` branch for the README badge. To measure locally (requires
+`cargo-llvm-cov` and the `llvm-tools` component):
+
+```sh
+cargo llvm-cov --locked --ignore-filename-regex '(^|/)tests/'
+```
 
 The library tests compare k-mer iteration with an exhaustive naive baseline.
 Integration tests exercise each command, all input combinations, gzip, known
