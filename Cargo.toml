@@ -1,0 +1,12 @@
+[package]
+name = "aiips"
+version = "0.1.0"
+edition = "2021"
+description = "Experimental sequence sketching toolkit"
+
+[dependencies]
+needletail = { version = "0.7", default-features = false, features = ["flate2"] }
+
+[profile.release]
+lto = "thin"
+
