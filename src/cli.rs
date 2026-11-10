@@ -44,9 +44,8 @@ fn output_path(value: OsString) -> Result<PathBuf, String> {
             output.display()
         ));
     }
-    if output.is_dir() {
-        return Err(format!("{}: output is a directory", output.display()));
-    }
+    // Existence and type are checked on the final, suffixed destination by
+    // the sketch preflight; an unsuffixed directory name does not block it.
     if is_sketch(&output) {
         return Ok(output);
     }

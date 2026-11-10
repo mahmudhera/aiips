@@ -698,15 +698,51 @@ fn sketch_rejects_directory_like_output_spellings() {
 #[test]
 fn sketch_existing_directory_never_suggests_force() {
     let t = Workspace::new();
+    fs::create_dir(t.path("dir.aiips")).unwrap();
     for name in ["dir", "dir.aiips"] {
-        fs::create_dir(t.path(name)).unwrap();
-        let result = t.run(&["sketch", "good.fa", "-o", name]);
-        assert_eq!(result.status.code(), Some(1));
-        let stderr = String::from_utf8(result.stderr).unwrap();
-        assert!(stderr.contains("directory"));
-        assert!(!stderr.contains("use -f"));
-        assert!(result.stdout.is_empty());
+        for force in [false, true] {
+            let mut args = vec!["sketch", "good.fa", "-o", name];
+            if force {
+                args.push("-f");
+            }
+            let result = t.run(&args);
+            assert_eq!(result.status.code(), Some(1), "{args:?}");
+            let stderr = String::from_utf8(result.stderr).unwrap();
+            assert!(
+                stderr.contains("dir.aiips: output is a directory"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("use -f"), "{stderr}");
+            assert!(result.stdout.is_empty());
+        }
     }
+    t.assert_no_staging_files();
+}
+
+#[test]
+fn sketch_unsuffixed_directory_name_does_not_block_suffixed_output() {
+    let t = Workspace::new();
+    fs::create_dir(t.path("results")).unwrap();
+    let stdout = t.success(&["sketch", "good.fa", "-o", "results"]);
+    assert!(stdout.ends_with("output\tresults.aiips\n"));
+    t.assert_empty("results.aiips");
+    assert!(fs::metadata(t.path("results")).unwrap().is_dir());
+    assert_eq!(fs::read_dir(t.path("results")).unwrap().count(), 0);
+}
+
+#[test]
+fn workspace_reservation_gives_up_after_bounded_collisions() {
+    let t = Workspace::new();
+    let taken = t.path("taken");
+    fs::create_dir(&taken).unwrap();
+    let mut calls = 0;
+    let error = reserve_directory(|| {
+        calls += 1;
+        taken.clone()
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(calls, common::MAX_RESERVE_ATTEMPTS);
 }
 
 #[test]

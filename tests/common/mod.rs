@@ -2,15 +2,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub const MAX_RESERVE_ATTEMPTS: u32 = 1000;
+
+/// Creates the first unused candidate directory, giving up after a fixed
+/// number of collisions so a misbehaving filesystem cannot hang tests.
 pub fn reserve_directory(mut candidate: impl FnMut() -> PathBuf) -> std::io::Result<PathBuf> {
-    loop {
+    for _ in 0..MAX_RESERVE_ATTEMPTS {
         let path = candidate();
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no unused directory name after {MAX_RESERVE_ATTEMPTS} attempts"),
+    ))
 }
 
 /// Isolates all artifacts, including retained backups and directories, under one

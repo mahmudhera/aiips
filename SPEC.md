@@ -35,9 +35,11 @@ aiips compare INPUT_A INPUT_B [-k LENGTH]
 - Accept exactly one plain/gzip FASTA/FASTQ file, detected by content.
 - Require `-o`/`--output`. Append `.aiips` unless the final extension already
   matches case-insensitively. Print the actual destination on success.
-- Treat the dotfile `.aiips` as already suffixed. Reject directory destinations
-  and spellings ending in a separator, `.` or `..`, before appending any suffix.
-  Directory errors must not suggest using force.
+- Treat the dotfile `.aiips` as already suffixed. Reject spellings ending in a
+  separator, `.` or `..`, before appending any suffix. Reject a directory at the
+  final (suffixed) destination; a directory named like the unsuffixed spelling
+  does not block it. Directory errors must not suggest using force, and no error
+  suggests force when force was already given.
 - Recognize every separator accepted by the target platform (both `/` and `\`
   on Windows) when rejecting directory-like output spellings.
 - Preflight output existence, type, aliases, and destination-parent validity

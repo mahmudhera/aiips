@@ -54,21 +54,66 @@ fn same_file(_: &Metadata, _: &Metadata, a: &Path, b: &Path) -> bool {
         .is_some_and(|(a, b)| a == b)
 }
 
+const MAX_UNIQUE_ATTEMPTS: u32 = 1000;
+
+/// Retries `attempt` while it reports AlreadyExists, with a fixed bound so a
+/// filesystem that rejects every new name cannot hang the command.
+fn retry_unique<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for _ in 0..MAX_UNIQUE_ATTEMPTS {
+        match attempt() {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            result => return result,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no unused temporary name after {MAX_UNIQUE_ATTEMPTS} attempts"),
+    ))
+}
+
+fn parent_dir(output: &Path) -> &Path {
+    output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn exists_error(output: &Path) -> String {
+    error(
+        output,
+        "output already exists; use -f or --force to overwrite",
+    )
+}
+
+/// Diagnoses a failed create/rename at the destination. Suggests force only
+/// when it was not already given and the occupant is not a directory.
+fn install_error(output: &Path, e: io::Error, force: bool) -> String {
+    if fs::symlink_metadata(output).is_ok_and(|m| m.is_dir()) {
+        error(output, "output is a directory")
+    } else if !force && e.kind() == io::ErrorKind::AlreadyExists {
+        exists_error(output)
+    } else {
+        error(output, e)
+    }
+}
+
 // Owns only paths created by this invocation. Cleanup must never panic.
 struct StagedOutput(Option<PathBuf>);
 
 impl StagedOutput {
     fn create(parent: &Path, destination: &Path) -> Result<Self, String> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        loop {
+        let path = retry_unique(|| {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!(".aiips-{}-{id}.tmp", std::process::id()));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self(Some(path))),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(error(destination, e)),
-            }
-        }
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map(|_| path)
+        })
+        .map_err(|e| error(destination, e))?;
+        Ok(Self(Some(path)))
     }
 
     fn path(&self) -> &Path {
@@ -90,7 +135,27 @@ struct OutputTransaction {
     installed: bool,
 }
 
+/// Full preflight before parsing input: existing-output safeguards plus a
+/// destination-parent check.
 fn preflight_output(
+    input: &Path,
+    source: &Metadata,
+    output: &Path,
+    force: bool,
+) -> Result<Option<Metadata>, String> {
+    let existing = check_existing(input, source, output, force)?;
+    if !fs::metadata(parent_dir(output))
+        .map_err(|e| error(output, e))?
+        .is_dir()
+    {
+        return Err(error(output, "destination parent must be a directory"));
+    }
+    Ok(existing)
+}
+
+/// Existence, type, and alias safeguards. Rechecked just before install
+/// because the output may change while the input is being parsed.
+fn check_existing(
     input: &Path,
     source: &Metadata,
     output: &Path,
@@ -122,23 +187,13 @@ fn preflight_output(
             return Err(error(output, "output resolves to the input file"));
         }
         if !force {
-            return Err(error(
-                output,
-                "output already exists; use -f or --force to overwrite",
-            ));
+            return Err(exists_error(output));
         }
         #[cfg(not(unix))]
         return Err(error(
             output,
             "forced replacement requires Unix file-identity safeguards",
         ));
-    }
-    let parent = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !fs::metadata(parent).map_err(|e| error(output, e))?.is_dir() {
-        return Err(error(output, "destination parent must be a directory"));
     }
     Ok(existing)
 }
@@ -150,7 +205,18 @@ impl OutputTransaction {
         output: &Path,
         force: bool,
     ) -> Result<Self, String> {
-        let existing = preflight_output(input, source, output, force)?;
+        // A missing parent is reported by the create/rename below, so only the
+        // existing-output safeguards need rechecking here.
+        let existing = check_existing(input, source, output, force)?;
+        Self::install_checked(output, force, existing)
+    }
+
+    /// Installs after safeguards passed; `existing` is the recheck's result.
+    fn install_checked(
+        output: &Path,
+        force: bool,
+        existing: Option<Metadata>,
+    ) -> Result<Self, String> {
         if !force {
             // The placeholder is empty, so create it exclusively without requiring
             // hard-link support. create_new is atomic even after the preflight.
@@ -158,26 +224,14 @@ impl OutputTransaction {
                 .write(true)
                 .create_new(true)
                 .open(output)
-                .map_err(|e| {
-                    if e.kind() == io::ErrorKind::AlreadyExists {
-                        error(
-                            output,
-                            "output already exists; use -f or --force to overwrite",
-                        )
-                    } else {
-                        error(output, e)
-                    }
-                })?;
+                .map_err(|e| install_error(output, e, false))?;
             return Ok(Self {
                 destination: output.into(),
                 backup: None,
                 installed: true,
             });
         }
-        let parent = output
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+        let parent = parent_dir(output);
         let staged = StagedOutput::create(parent, output)?;
         if let Some(metadata) = existing.as_ref().filter(|m| m.is_file()) {
             fs::set_permissions(staged.path(), metadata.permissions())
@@ -190,19 +244,19 @@ impl OutputTransaction {
         };
         if existing.is_some() {
             let backup = StagedOutput::create(parent, output)?;
-            fs::rename(output, backup.path()).map_err(|e| error(output, e))?;
+            if let Err(e) = fs::rename(output, backup.path()) {
+                // Nothing was moved; remove both staging files before reporting.
+                drop(backup);
+                drop(staged);
+                return Err(format!(
+                    "{}: could not move existing output aside for replacement: {e}; existing output left unchanged",
+                    output.display()
+                ));
+            }
             transaction.backup = Some(backup);
         }
-        let result = fs::rename(staged.path(), output);
-        if let Err(e) = result {
-            let message = if e.kind() == io::ErrorKind::AlreadyExists {
-                error(
-                    output,
-                    "output already exists; use -f or --force to overwrite",
-                )
-            } else {
-                error(output, e)
-            };
+        if let Err(e) = fs::rename(staged.path(), output) {
+            let message = install_error(output, e, true);
             return Err(transaction.with_rollback(message));
         }
         transaction.installed = true;
@@ -495,5 +549,99 @@ mod tests {
             result.unwrap_err(),
             "stdout: injected comparison write failure"
         );
+    }
+
+    fn assert_no_staging_files(directory: &Path) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".aiips-"),
+                "leftover staging file {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_appearing_after_recheck_never_suggests_force() {
+        for force in [false, true] {
+            let directory = TestDirectory::new();
+            let destination = directory.join("out.aiips");
+            // Simulates a directory created between the recheck and install.
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("keep"), b"keep").unwrap();
+            let message = OutputTransaction::install_checked(&destination, force, None)
+                .err()
+                .unwrap();
+            assert!(message.contains("output is a directory"), "{message}");
+            assert!(!message.contains("use -f"), "{message}");
+            assert_eq!(fs::read(destination.join("keep")).unwrap(), b"keep");
+            assert_no_staging_files(&directory);
+        }
+    }
+
+    #[test]
+    fn already_exists_suggests_force_only_when_not_forced() {
+        let directory = TestDirectory::new();
+        let destination = directory.join("out.aiips");
+        fs::write(&destination, b"").unwrap();
+        let unforced = install_error(&destination, io::ErrorKind::AlreadyExists.into(), false);
+        assert!(unforced.contains("use -f or --force"), "{unforced}");
+        let forced = install_error(&destination, io::ErrorKind::AlreadyExists.into(), true);
+        assert!(!forced.contains("-f"), "{forced}");
+        assert!(forced.starts_with(&destination.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_move_failure_reports_unchanged_output_and_cleans_staging() {
+        let directory = TestDirectory::new();
+        let destination = directory.join("out.aiips");
+        fs::write(&destination, b"original result").unwrap();
+        let existing = fs::metadata(&destination).unwrap();
+        // Make rename(output, backup) fail after the recheck observed a file.
+        fs::remove_file(&destination).unwrap();
+        let message = OutputTransaction::install_checked(&destination, true, Some(existing))
+            .err()
+            .unwrap();
+        assert!(
+            message.contains("could not move existing output aside"),
+            "{message}"
+        );
+        assert!(
+            message.contains("existing output left unchanged"),
+            "{message}"
+        );
+        assert!(!destination.exists());
+        assert_no_staging_files(&directory);
+    }
+
+    #[test]
+    fn retry_unique_is_bounded_and_retries_only_collisions() {
+        let mut calls = 0;
+        let result: io::Result<()> = retry_unique(|| {
+            calls += 1;
+            Err(io::ErrorKind::AlreadyExists.into())
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, MAX_UNIQUE_ATTEMPTS);
+
+        let mut calls = 0;
+        let result = retry_unique(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::ErrorKind::AlreadyExists.into())
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+
+        let mut calls = 0;
+        let result: io::Result<()> = retry_unique(|| {
+            calls += 1;
+            Err(io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1);
     }
 }
