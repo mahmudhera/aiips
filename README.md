@@ -129,8 +129,12 @@ the input's distinct canonical k-mers. A k-mer's canonical form is the smaller
 2-bit encoding (A=0, C=1, G=2, T=3) of the k-mer and its reverse complement, so
 sketches are strand-independent. Hash function `i` is
 `fmix64(kmer XOR seed_i)`, MurmurHash3's 64-bit finalizer with `seed_i` the `i`-th
-SplitMix64 output from `--seed`. This approximates, but does not guarantee,
-min-wise independence. Sketching costs `s` hash evaluations per k-mer and uses
+SplitMix64 output from `--seed`. fmix64 is a bijection, so distinct k-mers never
+collide within one hash function, but that does not make the family min-wise
+independent (Broder et al. 1998 distinguish exact from approximate min-wise
+independence). All functions derive deterministically from one seed rather than
+being independently sampled, and no approximation-error bound is established for
+this family; it is a practical heuristic. Sketching costs `s` hash evaluations per k-mer and uses
 O(`s`) memory; sequences are never stored.
 
 ### Compare two inputs
@@ -165,25 +169,38 @@ input_a\tinput_b\tjaccard\tcontainment_a_in_b\tcontainment_b_in_a\tani\taf_a_to_
 sample.aiips\treads.aiips\t1.000000\t1.000000\t1.000000\t1.000000\t-1\t-1\t1.000000\t1.000000
 ```
 
-Estimators, with `s` hash functions and minima `a_i`, `b_i`:
+Estimators, with `s` hash functions and minima `a_i`, `b_i`. Their stated
+properties hold in the ideal model of independent, uniformly random hash
+functions; the seeded fmix64 family above only approximates that model.
 
 - `jaccard`: `J = #{i : a_i = b_i} / s` (Broder 1997).
-- Distinct k-mer counts: `n = (s - 1) / Σ -ln(1 - a_i / 2^64)`, unbiased because
-  each term is exponential with rate `n` (Cohen 1997).
+- Distinct k-mer counts: `n = (s - 1) / Σ -ln(1 - a_i / 2^64)` (Cohen 1997). In the
+  ideal continuous model each term is exponential with rate `n`, which makes the
+  estimator unbiased; here it is a practical approximation.
 - `containment_a_in_b`: `|A ∩ B| / |A|` with `|A ∩ B| = J / (1 + J) · (|A| + |B|)`
   (Koslicki & Zabeti 2019), clamped to [0, 1].
 - `ani`: `1 - D`, with Mash distance `D = -(1/k) ln(2J / (1 + J))` and `D = 1` at
   `J = 0` (Ondov et al. 2016), clamped at 0.
-- `ani_containment_a_in_b`: `C^(1/k)` under the simple mutation model (Blanca et
-  al. 2022; Hera et al. 2023), 0 when `C = 0`.
+- `ani_containment_a_in_b`: `C^(1/k)`. Hera, Pierce-Ward & Koslicki (2023) derive
+  `E[C] = (1 - p)^k` (Theorem 5, Eq. 5) and the point estimate
+  `p̂ = 1 - C^(1/k)`, so ANI = `1 - p̂` = `C^(1/k)` (see also Blanca et al. 2022).
+  Their model assumes independent substitutions and excludes spurious k-mer
+  matches and repeats. The paper's guarantees and confidence intervals are for its
+  debiased FracMinHash containment; they do not transfer to this containment,
+  which is derived from MinHash Jaccard and estimated counts. The root is
+  nonlinear, so it does not preserve unbiasedness. Reporting 0 when `C = 0` is a
+  convention, not evidence of zero biological identity.
 - `af_a_to_b`, `af_b_to_a`: always `-1` (unavailable). Alignment fraction needs
   k-mer positions, which a global MinHash discards: tools reporting AF map
   positional seeds (FastANI via Mashmap, skani via chaining). Under the simple
   mutation model containment is about `AF · q^k`, so one containment value cannot
   separate AF from identity `q`.
 
-Values are printed with six decimals. Estimates have sampling error of roughly
-`sqrt(J(1 - J)/s)` for Jaccard and `1/sqrt(s)` relative error for the counts.
+Values are printed with six decimals. In the ideal model, estimates have sampling
+error of roughly `sqrt(J(1 - J)/s)` for Jaccard and `1/sqrt(s)` relative error for
+the counts. These figures omit any bias or dependence from the hash family. The
+tests confirm accuracy on their fixed cases (known sets, phiX174 mutated at known
+rates), not hash-family independence or an error bound.
 `compare` does not accept `-o`, `--force`, or sketch options.
 
 ### Shared behavior

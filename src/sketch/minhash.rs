@@ -315,8 +315,10 @@ pub fn jaccard(a: &[u64], b: &[u64]) -> f64 {
 }
 
 /// Distinct-element estimate n̂ = (s − 1) / Σ −ln(1 − u_i), with u_i the
-/// minima scaled to [0, 1). Each −ln(1 − u_i) is Exp(n), so the estimator is
-/// unbiased (Cohen 1997). Requires s >= 2.
+/// minima scaled to [0, 1) (Cohen 1997). In the ideal model of independent,
+/// uniformly random hash values, each −ln(1 − u_i) is Exp(n) and the estimator
+/// is unbiased. The seeded fmix64 family only approximates that model, so here
+/// it is a practical approximation. Requires s >= 2.
 pub fn cardinality(mins: &[u64]) -> f64 {
     assert!(mins.len() >= MIN_NUM_HASHES, "need at least two minima");
     const SCALE: f64 = 1.0 / 18_446_744_073_709_551_616.0; // 2^-64
@@ -348,8 +350,12 @@ pub fn mash_ani(jaccard: f64, k: usize) -> f64 {
     (1.0 - distance).max(0.0)
 }
 
-/// Containment ANI point estimate C^(1/k) under the simple mutation model
-/// (Blanca et al. 2022; Hera et al. 2023); 0 when C = 0.
+/// Containment ANI point estimate C^(1/k): Hera, Pierce-Ward & Koslicki (2023)
+/// derive E[C] = (1 − p)^k (Theorem 5) and p̂ = 1 − C^(1/k); see also Blanca et
+/// al. 2022. That model assumes independent substitutions without spurious
+/// matches or repeats, and its guarantees are for FracMinHash containment, not
+/// this MinHash-derived containment. The root does not preserve unbiasedness.
+/// Returning 0 when C = 0 is a convention, not evidence of zero identity.
 pub fn containment_ani(containment: f64, k: usize) -> f64 {
     if containment <= 0.0 {
         0.0
