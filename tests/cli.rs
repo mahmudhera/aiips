@@ -1,37 +1,18 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{reserve_directory, TestDirectory};
 
 const STATS: &str = "input\trecords\tbases\tnon_acgt_bases\tk\tvalid_kmers";
 const METRICS: &str =
     "input_a\tinput_b\tjaccard\tcontainment_a_in_b\tcontainment_b_in_a\tani\taf_a_to_b\taf_b_to_a";
 
-struct Workspace(PathBuf);
-
-fn reserve_directory(mut candidate: impl FnMut() -> PathBuf) -> std::io::Result<PathBuf> {
-    loop {
-        let path = candidate();
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
+struct Workspace(TestDirectory);
 
 impl Workspace {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = reserve_directory(|| {
-            std::env::temp_dir().join(format!(
-                "aiips-cli-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ))
-        })
-        .expect("create isolated test workspace");
-        let workspace = Self(path);
+        let workspace = Self(TestDirectory::new());
         for (name, bytes) in [
             ("good.fa", include_bytes!("fixtures/sample.fa").as_slice()),
             ("good.fq", include_bytes!("fixtures/sample.fq").as_slice()),
@@ -105,12 +86,6 @@ impl Workspace {
             .file_name()
             .to_string_lossy()
             .starts_with(".aiips-")));
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -864,4 +839,121 @@ fn sketch_closed_stdout_restores_original_symlink_and_target() {
     );
     assert_eq!(fs::read(t.path("original")).unwrap(), b"keep target");
     t.assert_no_staging_files();
+}
+
+#[test]
+fn repeated_k_is_rejected_for_both_commands_and_aliases() {
+    let t = Workspace::new();
+    for command in ["sketch", "compare"] {
+        for flags in [["-k", "-k"], ["-k", "--kmer-size"], ["--kmer-size", "-k"]] {
+            let mut args = vec![command, "good.fa"];
+            if command == "sketch" {
+                args.extend(["-o", "out"]);
+            } else {
+                args.push("good.fq");
+            }
+            args.extend([flags[0], "15", flags[1], "31"]);
+            t.failure(&args, "k-mer length may only be specified once");
+        }
+    }
+    assert!(!t.path("out.aiips").exists());
+}
+
+#[test]
+fn sketch_existing_output_is_rejected_before_parsing_invalid_input() {
+    let t = Workspace::new();
+    t.write("out.aiips", b"keep existing result");
+    t.failure(&["sketch", "bad.fq", "-o", "out"], "output already exists");
+    assert_eq!(
+        fs::read(t.path("out.aiips")).unwrap(),
+        b"keep existing result"
+    );
+    t.assert_no_staging_files();
+}
+
+#[test]
+fn sketch_alias_is_rejected_before_parsing_invalid_input() {
+    let t = Workspace::new();
+    t.write("invalid.aiips", b"not FASTX");
+    t.failure(
+        &["sketch", "invalid.aiips", "-o", "invalid.aiips", "--force"],
+        "output resolves to the input",
+    );
+    assert_eq!(fs::read(t.path("invalid.aiips")).unwrap(), b"not FASTX");
+}
+
+#[cfg(unix)]
+#[test]
+fn sketch_symlink_is_rejected_before_parsing_invalid_input() {
+    let t = Workspace::new();
+    std::os::unix::fs::symlink("empty.aiips", t.path("out.aiips")).unwrap();
+    t.failure(&["sketch", "bad.fq", "-o", "out"], "output already exists");
+    assert_eq!(
+        fs::read_link(t.path("out.aiips")).unwrap(),
+        PathBuf::from("empty.aiips")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sketch_special_output_is_rejected_before_parsing_invalid_input() {
+    let t = Workspace::new();
+    let _socket = std::os::unix::net::UnixListener::bind(t.path("out.aiips")).unwrap();
+    t.failure(
+        &["sketch", "bad.fq", "-o", "out", "--force"],
+        "regular file or symlink",
+    );
+    t.assert_no_staging_files();
+}
+
+#[test]
+fn help_precedes_duplicate_k_but_not_after_double_dash() {
+    let t = Workspace::new();
+    assert!(t
+        .success(&["compare", "-k", "15", "--kmer-size", "31", "--help"])
+        .contains("Usage: aiips compare"));
+    t.failure(
+        &["compare", "-k", "15", "-k", "31", "--", "--help", "good.fa"],
+        "may only be specified once",
+    );
+    t.failure(&["compare", "-k", "--", "--help"], "positive integer");
+}
+
+#[test]
+fn sketch_missing_parent_is_rejected_before_parsing_invalid_input() {
+    let t = Workspace::new();
+    t.failure(
+        &["sketch", "bad.fq", "-o", "missing/out"],
+        "missing/out.aiips",
+    );
+    assert!(!t.path("missing").exists());
+}
+
+#[test]
+fn workspace_removes_retained_backup_and_directory_during_unwind() {
+    let directory = TestDirectory::new();
+    let root = directory.to_path_buf();
+    let result = std::panic::catch_unwind(move || {
+        fs::write(directory.join("retained-backup.tmp"), b"original result").unwrap();
+        fs::create_dir(directory.join("failed-replacement.tmp")).unwrap();
+        panic!("simulated failed assertion");
+    });
+    assert!(result.is_err());
+    assert!(!root.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn sketch_windows_accepts_both_separator_styles_for_path_validation() {
+    let t = Workspace::new();
+    for spelling in [
+        "missing/",
+        "missing\\",
+        "missing/.",
+        "missing\\.",
+        "missing/..",
+        "missing\\..",
+    ] {
+        t.failure(&["sketch", "good.fa", "-o", spelling], "directory");
+    }
 }

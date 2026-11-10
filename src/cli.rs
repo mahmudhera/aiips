@@ -32,10 +32,10 @@ fn output_path(value: OsString) -> Result<PathBuf, String> {
     let output = path(value)?;
     // Components normalize trailing separators and '.', so check the original spelling too.
     let spelling = output.as_os_str().to_string_lossy();
-    if spelling.ends_with(std::path::MAIN_SEPARATOR)
+    if spelling.chars().last().is_some_and(std::path::is_separator)
         || output.file_name().is_none()
         || matches!(
-            spelling.rsplit(std::path::MAIN_SEPARATOR).next(),
+            spelling.rsplit(std::path::is_separator).next(),
             Some("." | "..")
         )
     {
@@ -91,14 +91,17 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut inputs = Vec::new();
     let mut output = None;
     let mut k = NonZeroUsize::new(21).unwrap();
+    let mut k_specified = false;
     let mut force = false;
     let mut positional_only = false;
     while let Some(arg) = args.next() {
-        if !positional_only && (arg == "-h" || arg == "--help") {
-            return Ok(Command::Help(help));
-        } else if !positional_only && arg == "--" {
+        if !positional_only && arg == "--" {
             positional_only = true;
         } else if !positional_only && (arg == "-k" || arg == "--kmer-size") {
+            if k_specified {
+                return Err(format!("k-mer length may only be specified once\n{help}"));
+            }
+            k_specified = true;
             k = args
                 .next()
                 .and_then(|v| v.to_str().and_then(|s| s.parse().ok()))

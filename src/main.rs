@@ -2,6 +2,10 @@ mod cli;
 mod commands;
 mod report;
 
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_support;
+
 use std::io;
 use std::process::ExitCode;
 

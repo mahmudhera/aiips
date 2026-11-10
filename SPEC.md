@@ -7,6 +7,10 @@ Reuse streaming FASTA/FASTQ parsing and existing k-mer semantics. This stage cre
 empty placeholder sketches and unavailable metric values; actual sketching,
 serialization, and estimation are future work.
 
+The user explicitly approved removal of the legacy command and stdin support.
+This is an authorized exception to AGENTS.md's general CLI-preservation rule;
+the subcommand interface is the compatibility baseline going forward.
+
 ## Command contract
 
 ```text
@@ -22,6 +26,8 @@ aiips compare INPUT_A INPUT_B [-k LENGTH]
   accepted; stdin (`-`) is rejected. Output values beginning with `-` must use an
   explicit path prefix, such as `./`, to distinguish them from missing values.
 - `-k`/`--kmer-size` defaults to 21 and accepts positive values fitting `usize`.
+  Repeating either spelling, including mixed spellings, is an error. Help before
+  `--` still takes precedence over that error.
 - No speculative algorithm options or metric-selection flags are introduced.
 
 ## Sketch
@@ -32,7 +38,14 @@ aiips compare INPUT_A INPUT_B [-k LENGTH]
 - Treat the dotfile `.aiips` as already suffixed. Reject directory destinations
   and spellings ending in a separator, `.` or `..`, before appending any suffix.
   Directory errors must not suggest using force.
+- Recognize every separator accepted by the target platform (both `/` and `\`
+  on Windows) when rejecting directory-like output spellings.
+- Preflight output existence, type, aliases, and destination-parent validity
+  before parsing sequence content. Recheck output safeguards before installing
+  the result; preflight must not create output or bypass exclusive creation.
 - Fully parse and summarize the input before creating a zero-byte output.
+- Without force, create the empty output with atomic exclusive file creation;
+  require no hard-link support and never fall back to a replacing rename.
 - Refuse existing output by default, explaining `-f`/`--force` in the error.
 - Support force only on `sketch`: stage replacement in the destination directory
   and rename after successful validation. Preserve existing output on parsing or
@@ -49,6 +62,9 @@ aiips compare INPUT_A INPUT_B [-k LENGTH]
   file/symlink. If restoration fails, retain the original backup and report its
   path. Partial stdout cannot be retracted. Abrupt termination/crash recovery and
   concurrent external path changes are outside this rollback guarantee.
+- Once stdout writes and flush succeed, commit the new output. If deleting the
+  old backup then fails, keep both files, warn on stderr with the backup path,
+  and exit successfully; do not restore old data over reported-success output.
 - Print the statistics table followed by `output<TAB>actual-path` to stdout.
 
 ## Compare
@@ -85,6 +101,7 @@ where applicable. Return status 0 on success and 1 on error. Validate inputs bef
 printing success output. Empty/malformed sequence files, missing files, and
 non-regular inputs fail. Escape backslash, tab, carriage return, and newline in
 TSV filenames. Keep the dependency set unchanged.
+Every stdout write/flush error, including compare statistics, names `stdout:`.
 
 ## Acceptance checks
 
@@ -101,6 +118,9 @@ TSV filenames. Keep the dependency set unchanged.
   diagnostics, permissions, stdout write/flush rollback, help precedence, sketch
   validation, output-option validation, and resilient temporary workspaces.
   Workspace creation must retry collisions; cleanup must not panic during unwind.
+- Both unit and integration filesystem tests use the shared isolated workspace
+  helper, so retained backups and directories are cleaned up even on assertion
+  failure. Inject backup-cleanup and stdout failures for deterministic coverage.
 
 `.aiips` identifies an empty placeholder only and establishes no future binary
 format. Real sketch metadata and estimator definitions remain out of scope.

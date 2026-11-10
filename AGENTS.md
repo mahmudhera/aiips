@@ -8,6 +8,10 @@ want something very fast and efficient.
 - Prefer simple, modular implementations.
 - Do not introduce unnecessary dependencies.
 - Preserve existing command-line interfaces if there is any.
+  - Authorized exception: the user-approved placeholder CLI specification in
+    SPEC.md replaces the legacy `aiips [-k] INPUT...` command and stdin support
+    with `sketch`/`compare` and file-only inputs. Preserve this subcommand interface
+    in subsequent work unless the user explicitly authorizes another change.
 - If using libraries, prefer header-only libraries.
 - Implement things in lightweight manner. Should be both fast and memory efficient.
 

@@ -31,6 +31,8 @@ in `Cargo.lock`.
 ```
 
 The previous `aiips INPUT...` interface has been removed. A subcommand is required.
+This removal and the stdin change were explicitly approved in SPEC.md, as a
+specific exception to the general CLI-preservation rule in AGENTS.md.
 Stdin (`-`) is not supported. Use `--` before positional filenames beginning with
 `-`; options must precede that separator. For output names beginning with `-`,
 pass an explicit relative path, such as `-o ./-sample`.
@@ -48,6 +50,9 @@ becomes `sample.txt.aiips`. The actual destination is printed on success.
 The dotfile `.aiips` is already a valid sketch name and is not suffixed again.
 Directory destinations and directory-like spellings (`outdir/`, `.`, `..`) are
 rejected, without suggesting that force can replace a directory.
+Output existence, file type, input aliases, and the destination parent are checked
+before scanning sequence content, then rechecked before installation. New output
+uses atomic exclusive creation and does not require filesystem hard-link support.
 
 The output is an **empty placeholder file**, containing no sequence information,
 parameters, or actual sketch data. Existing output paths are refused unless
@@ -72,6 +77,9 @@ If restoration itself fails, the error reports the retained backup path for
 recovery. Output may already be partially printed when stdout fails. This is
 rollback for reported errors, not a crash-recovery protocol or a guarantee against
 concurrent external changes to the same paths.
+After a successful stdout flush, the new output is committed. A failure to remove
+the old backup then leaves the new output in place, prints a warning on stderr
+with the retained backup path, and keeps exit status 0.
 
 Successful output is TSV statistics followed by the output path:
 
@@ -115,6 +123,7 @@ implemented by these placeholders. `compare` does not accept `-o` or `--force`.
 ### Shared behavior
 
 `-k`/`--kmer-size` defaults to 21 and accepts any positive length fitting `usize`.
+Each command accepts this option once; repeated short/long spellings are errors.
 It applies to sequence statistics; placeholders cannot recover or validate `k`.
 `valid_kmers` counts every overlapping A/C/G/T occurrence in either case, including
 repeats, rather than distinct k-mers. Other bases break valid runs. Windows never
