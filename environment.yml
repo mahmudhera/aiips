@@ -1,0 +1,9 @@
+name: aiips
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Includes cargo, rustfmt, and clippy; matches the tested toolchain.
+  - rust=1.99.1
+  # Native linker/toolchain used to build Rust executables.
+  - c-compiler
