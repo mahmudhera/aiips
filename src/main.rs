@@ -2,14 +2,13 @@ mod cli;
 mod commands;
 mod report;
 
-use std::io::{self, Write};
+use std::io;
 use std::process::ExitCode;
 
 fn run() -> Result<(), String> {
     let command = cli::parse(std::env::args_os().skip(1))?;
     let mut output = io::BufWriter::new(io::stdout().lock());
-    commands::execute(command, &mut output)?;
-    output.flush().map_err(|error| error.to_string())
+    commands::execute(command, &mut output)
 }
 
 fn main() -> ExitCode {

@@ -21,8 +21,38 @@ pub enum Command {
 }
 
 pub fn is_sketch(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("aiips"))
+    path.file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(".aiips"))
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("aiips"))
+}
+
+fn output_path(value: OsString) -> Result<PathBuf, String> {
+    let output = path(value)?;
+    // Components normalize trailing separators and '.', so check the original spelling too.
+    let spelling = output.as_os_str().to_string_lossy();
+    if spelling.ends_with(std::path::MAIN_SEPARATOR)
+        || output.file_name().is_none()
+        || matches!(
+            spelling.rsplit(std::path::MAIN_SEPARATOR).next(),
+            Some("." | "..")
+        )
+    {
+        return Err(format!(
+            "{}: output must name a file, not a directory",
+            output.display()
+        ));
+    }
+    if output.is_dir() {
+        return Err(format!("{}: output is a directory", output.display()));
+    }
+    if is_sketch(&output) {
+        return Ok(output);
+    }
+    let mut name = output.file_name().unwrap().to_os_string();
+    name.push(".aiips");
+    Ok(output.with_file_name(name))
 }
 
 fn path(value: OsString) -> Result<PathBuf, String> {
@@ -49,6 +79,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         }
     };
     let help = if sketch { SKETCH_HELP } else { COMPARE_HELP };
+    let remaining: Vec<_> = args.collect();
+    if remaining
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        return Ok(Command::Help(help));
+    }
+    let mut args = remaining.into_iter();
     let mut inputs = Vec::new();
     let mut output = None;
     let mut k = NonZeroUsize::new(21).unwrap();
@@ -73,10 +112,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             let value = args
                 .next()
                 .ok_or_else(|| format!("missing output path\n{help}"))?;
-            if value != "-" && value.to_string_lossy().starts_with('-') {
-                return Err(format!("missing output path before {}; use ./ for output names beginning with -\n{help}", value.to_string_lossy()));
+            let value = path(value)?;
+            if value.as_os_str().to_string_lossy().starts_with('-') {
+                return Err(format!("missing output path before {}; use ./ for output names beginning with -\n{help}", value.display()));
             }
-            output = Some(path(value)?);
+            output = Some(value);
         } else if !positional_only && sketch && (arg == "-f" || arg == "--force") {
             force = true;
         } else if !positional_only && arg != "-" && arg.to_string_lossy().starts_with('-') {
@@ -93,12 +133,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         ));
     }
     if sketch {
-        let mut output = output.ok_or_else(|| format!("-o/--output is required\n{help}"))?;
-        if !is_sketch(&output) {
-            let mut name = output.into_os_string();
-            name.push(".aiips");
-            output = name.into();
-        }
+        let output = output_path(
+            output
+                .ok_or_else(|| format!("-o/--output is required\n{help}"))?
+                .into_os_string(),
+        )?;
         Ok(Command::Sketch {
             input: inputs.remove(0),
             output,

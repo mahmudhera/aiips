@@ -16,7 +16,8 @@ aiips compare INPUT_A INPUT_B [-k LENGTH]
 
 - The old `aiips INPUT...` interface is removed. Missing/unknown commands and
   invalid arguments fail with usage guidance and exit status 1.
-- Top-level and command-specific `-h`/`--help` print help and exit 0.
+- Top-level and command-specific `-h`/`--help` print help and exit 0. For a valid
+  subcommand, help before `--` takes precedence over other invalid arguments.
 - `--` ends option parsing for positional filenames. Only filesystem paths are
   accepted; stdin (`-`) is rejected. Output values beginning with `-` must use an
   explicit path prefix, such as `./`, to distinguish them from missing values.
@@ -28,19 +29,34 @@ aiips compare INPUT_A INPUT_B [-k LENGTH]
 - Accept exactly one plain/gzip FASTA/FASTQ file, detected by content.
 - Require `-o`/`--output`. Append `.aiips` unless the final extension already
   matches case-insensitively. Print the actual destination on success.
+- Treat the dotfile `.aiips` as already suffixed. Reject directory destinations
+  and spellings ending in a separator, `.` or `..`, before appending any suffix.
+  Directory errors must not suggest using force.
 - Fully parse and summarize the input before creating a zero-byte output.
 - Refuse existing output by default, explaining `-f`/`--force` in the error.
 - Support force only on `sketch`: stage replacement in the destination directory
   and rename after successful validation. Preserve existing output on parsing or
   replacement failure; clean up staging files.
-- Reject output resolving to the input, including symlink aliases. Do not create
+- Reject output resolving to the input by Unix device/inode identity, including
+  case aliases, hardlinks, and symlinks. Do not create
   destination directories. Forced replacement replaces symlinks themselves.
+- Preserve permission bits when replacing a regular file. The new inode does not
+  preserve ownership, group, ACLs, xattrs, or timestamps; replacing a symlink does
+  not copy its target's metadata. Refuse forced replacement of existing paths on
+  non-Unix platforms until equivalent file-identity safeguards are implemented.
+- Keep an original-output backup until stdout writes and flush succeed. On a
+  reported output failure, remove newly created output or restore the original
+  file/symlink. If restoration fails, retain the original backup and report its
+  path. Partial stdout cannot be retracted. Abrupt termination/crash recovery and
+  concurrent external path changes are outside this rollback guarantee.
 - Print the statistics table followed by `output<TAB>actual-path` to stdout.
 
 ## Compare
 
 - Accept exactly two inputs, detecting each independently. A final `.aiips`
-  extension, case-insensitively, identifies a sketch. All other inputs are FASTX.
+  extension or whole filename, case-insensitively, identifies a sketch. All other
+  inputs are FASTX. Reuse one metadata lookup for type and placeholder-length
+  checks, rather than statting a sketch twice.
 - Support FASTX/FASTX, sketch/sketch, and mixed pairs.
 - Sketch inputs must be readable zero-byte regular files. Reject nonempty files
   until a real format is implemented.
@@ -81,6 +97,10 @@ TSV filenames. Keep the dependency set unchanged.
   temporary directories; never alter the downloaded genome or existing results.
 - Run locked Cargo tests, formatting checks, Clippy, a release build, and
   representative command invocations. Update README examples and limitations.
+- Cover every CODE_REVIEW.txt finding: aliases, suffix edge cases, directory
+  diagnostics, permissions, stdout write/flush rollback, help precedence, sketch
+  validation, output-option validation, and resilient temporary workspaces.
+  Workspace creation must retry collisions; cleanup must not panic during unwind.
 
 `.aiips` identifies an empty placeholder only and establishes no future binary
 format. Real sketch metadata and estimator definitions remain out of scope.

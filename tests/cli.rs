@@ -9,15 +9,28 @@ const METRICS: &str =
 
 struct Workspace(PathBuf);
 
+fn reserve_directory(mut candidate: impl FnMut() -> PathBuf) -> std::io::Result<PathBuf> {
+    loop {
+        let path = candidate();
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl Workspace {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "aiips-cli-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = reserve_directory(|| {
+            std::env::temp_dir().join(format!(
+                "aiips-cli-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+        })
+        .expect("create isolated test workspace");
         let workspace = Self(path);
         for (name, bytes) in [
             ("good.fa", include_bytes!("fixtures/sample.fa").as_slice()),
@@ -97,7 +110,7 @@ impl Workspace {
 
 impl Drop for Workspace {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -627,4 +640,228 @@ fn sketch_dash_prefixed_output_path() {
     let t = Workspace::new();
     t.success(&["sketch", "good.fa", "-o", "./-out"]);
     t.assert_empty("-out.aiips");
+}
+
+#[test]
+fn workspace_retries_stale_directory_without_reusing_it() {
+    let t = Workspace::new();
+    let stale = t.path("stale");
+    fs::create_dir(&stale).unwrap();
+    fs::write(stale.join("keep"), b"old run").unwrap();
+    let fresh = t.path("fresh");
+    let mut attempts = [stale.clone(), fresh.clone()].into_iter();
+    let reserved = reserve_directory(|| attempts.next().unwrap()).unwrap();
+    assert_eq!(reserved, fresh);
+    assert_eq!(fs::read(stale.join("keep")).unwrap(), b"old run");
+}
+
+#[test]
+fn workspace_cleanup_failure_does_not_mask_original_panic() {
+    let panic = std::panic::catch_unwind(|| {
+        let t = Workspace::new();
+        fs::remove_dir_all(&t.0).unwrap();
+        panic!("original assertion");
+    })
+    .unwrap_err();
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"original assertion"));
+}
+
+#[cfg(unix)]
+#[test]
+fn sketch_rejects_hardlink_alias() {
+    let t = Workspace::new();
+    fs::hard_link(t.path("good.fa"), t.path("alias.aiips")).unwrap();
+    t.failure(
+        &["sketch", "good.fa", "-o", "alias.aiips", "-f"],
+        "output resolves to the input",
+    );
+    assert_eq!(
+        fs::read(t.path("alias.aiips")).unwrap(),
+        include_bytes!("fixtures/sample.fa")
+    );
+    t.assert_no_staging_files();
+}
+
+#[cfg(unix)]
+#[test]
+fn sketch_rejects_case_alias_on_case_insensitive_filesystem() {
+    use std::os::unix::fs::MetadataExt;
+    let t = Workspace::new();
+    let data = b">a\nACGT\n";
+    t.write("reads.aiips", data);
+    match fs::metadata(t.path("READS.AIIPS")) {
+        Ok(alias) if alias.ino() == fs::metadata(t.path("reads.aiips")).unwrap().ino() => {
+            t.failure(
+                &["sketch", "reads.aiips", "-o", "READS.AIIPS", "--force"],
+                "output resolves to the input",
+            );
+            assert_eq!(fs::read(t.path("reads.aiips")).unwrap(), data);
+        }
+        _ => eprintln!("case-insensitive alias scenario unavailable on this filesystem"),
+    }
+}
+
+#[test]
+fn sketch_rejects_directory_like_output_spellings() {
+    let t = Workspace::new();
+    fs::create_dir(t.path("outdir")).unwrap();
+    for name in [
+        "outdir/",
+        "missing/",
+        ".",
+        "..",
+        "outdir/.",
+        "outdir/..",
+        "/",
+    ] {
+        t.failure(&["sketch", "good.fa", "-o", name], "directory");
+    }
+    assert!(!t.path("outdir/.aiips").exists());
+    assert!(!t.path("missing").exists());
+}
+
+#[test]
+fn sketch_existing_directory_never_suggests_force() {
+    let t = Workspace::new();
+    for name in ["dir", "dir.aiips"] {
+        fs::create_dir(t.path(name)).unwrap();
+        let result = t.run(&["sketch", "good.fa", "-o", name]);
+        assert_eq!(result.status.code(), Some(1));
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains("directory"));
+        assert!(!stderr.contains("use -f"));
+        assert!(result.stdout.is_empty());
+    }
+}
+
+#[test]
+fn sketch_dotfile_suffix_and_compare_detection() {
+    let t = Workspace::new();
+    for name in [".aiips", ".AIIPS"] {
+        let result = t.success(&["sketch", "good.fa", "-o", name]);
+        assert!(result.ends_with(&format!("output\t{name}\n")));
+        t.assert_empty(name);
+        assert!(!t.path(&format!("{name}.aiips")).exists());
+        assert!(t
+            .success(&["compare", name, "empty.aiips"])
+            .contains(&format!("{name}\tNA\tNA\tNA\tNA\tNA\n")));
+        fs::remove_file(t.path(name)).unwrap(); // Names may alias on APFS.
+    }
+    t.success(&["sketch", "good.fa", "-o", ".hidden"]);
+    t.assert_empty(".hidden.aiips");
+}
+
+#[cfg(unix)]
+#[test]
+fn sketch_force_preserves_permission_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Workspace::new();
+    t.write("out.aiips", b"old");
+    fs::set_permissions(t.path("out.aiips"), fs::Permissions::from_mode(0o640)).unwrap();
+    t.success(&["sketch", "good.fa", "-o", "out", "--force"]);
+    assert_eq!(
+        fs::metadata(t.path("out.aiips"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o640
+    );
+    t.assert_empty("out.aiips");
+    t.assert_no_staging_files();
+}
+
+#[test]
+fn command_help_precedes_invalid_options_and_values() {
+    let t = Workspace::new();
+    for subcommand in ["sketch", "compare"] {
+        for args in [
+            vec![subcommand, "--bogus", "--help"],
+            vec![subcommand, "-k", "0", "-h"],
+            vec![subcommand, "-o", "--help"],
+            vec![subcommand, "--help", "--bogus"],
+        ] {
+            assert!(t
+                .success(&args)
+                .contains(&format!("Usage: aiips {subcommand}")));
+        }
+    }
+}
+
+#[test]
+fn help_after_double_dash_is_a_filename() {
+    let t = Workspace::new();
+    t.write("--help", b">a\nACGT\n");
+    t.success(&["sketch", "-o", "out", "--", "--help"]);
+    t.success(&["compare", "--", "--help", "good.fa"]);
+    t.failure(
+        &["compare", "--bogus", "--", "--help", "good.fa"],
+        "unknown option",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sketch_closed_stdout_rolls_back_new_and_forced_outputs() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let t = Workspace::new();
+    for force in [false, true] {
+        if force {
+            t.write("out.aiips", b"old result");
+            fs::set_permissions(t.path("out.aiips"), fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        // Drop the read end before starting the child: deterministic EPIPE, no shell race.
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aiips"));
+        command
+            .current_dir(&t.0)
+            .args(["sketch", "good.fa", "-o", "out"])
+            .stdout(Stdio::from(writer));
+        if force {
+            command.arg("-f");
+        }
+        let result = command.output().unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&result.stderr).contains("stdout:"));
+        if force {
+            assert_eq!(fs::read(t.path("out.aiips")).unwrap(), b"old result");
+            assert_eq!(
+                fs::metadata(t.path("out.aiips"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o640
+            );
+        } else {
+            assert!(!t.path("out.aiips").exists());
+        }
+        t.assert_no_staging_files();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sketch_closed_stdout_restores_original_symlink_and_target() {
+    use std::process::Stdio;
+    let t = Workspace::new();
+    t.write("original", b"keep target");
+    std::os::unix::fs::symlink("original", t.path("out.aiips")).unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let result = Command::new(env!("CARGO_BIN_EXE_aiips"))
+        .current_dir(&t.0)
+        .args(["sketch", "good.fa", "-o", "out", "--force"])
+        .stdout(Stdio::from(writer))
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(
+        fs::read_link(t.path("out.aiips")).unwrap(),
+        PathBuf::from("original")
+    );
+    assert_eq!(fs::read(t.path("original")).unwrap(), b"keep target");
+    t.assert_no_staging_files();
 }

@@ -45,15 +45,33 @@ Accepts exactly one plain or gzip-compressed FASTA/FASTQ file, detected by conte
 `-o`/`--output` is required. `.aiips` is appended unless that extension is already
 present (case-insensitive): `sample` becomes `sample.aiips`, and `sample.txt`
 becomes `sample.txt.aiips`. The actual destination is printed on success.
+The dotfile `.aiips` is already a valid sketch name and is not suffixed again.
+Directory destinations and directory-like spellings (`outdir/`, `.`, `..`) are
+rejected, without suggesting that force can replace a directory.
 
 The output is an **empty placeholder file**, containing no sequence information,
 parameters, or actual sketch data. Existing output paths are refused unless
 `-f`/`--force` is supplied. Force replacement is staged in the destination directory
 after input validation; malformed input or replacement failure preserves the old
-output. Output aliases resolving to the input are rejected, even with force.
+output. File identity checks on Unix reject input aliases, including case aliases,
+hardlinks, and symlinks, even with force.
 Destination directories must already exist. Forced replacement replaces the
 output directory entry, including a symlink, rather than following it to truncate
 its target.
+
+Replacing a regular file preserves its permission bits. Replacement creates a new
+inode: ownership, group, ACLs, extended attributes, and timestamps are not
+preserved. Replacing a symlink does not copy metadata from its target. Forced
+replacement of existing paths is supported on Unix; other platforms refuse it
+because the dependency-free implementation cannot guarantee file identity there.
+
+The old output is retained in a temporary backup until the stdout report has been
+written and flushed successfully. A reported write or flush failure removes a new
+output or restores the previous file/symlink, including its original metadata.
+If restoration itself fails, the error reports the retained backup path for
+recovery. Output may already be partially printed when stdout fails. This is
+rollback for reported errors, not a crash-recovery protocol or a guarantee against
+concurrent external changes to the same paths.
 
 Successful output is TSV statistics followed by the output path:
 
@@ -71,7 +89,7 @@ Examples show tab characters as `\t` for readability.
 aiips compare INPUT_A INPUT_B [-k LENGTH]
 ```
 
-Each input whose final extension is `.aiips` (case-insensitive) must be a readable,
+Each input whose final extension or whole filename is `.aiips` (case-insensitive) must be a readable,
 zero-byte regular file. Nonempty sketches are rejected until a real format is
 implemented. Other inputs are parsed as plain/gzip FASTA/FASTQ. Two sequence files,
 two placeholders, or a mixed pair are supported.
@@ -108,6 +126,9 @@ where applicable, go to stderr, and return status 1; success returns 0. All inpu
 are validated before any success output is printed. Empty or malformed sequence
 files, missing files, and non-regular inputs are errors. Filenames in TSV escape
 backslash, tab, carriage return, and newline.
+
+Command-specific help takes precedence over invalid arguments anywhere before
+`--`. After `--`, `-h` and `--help` are literal filenames.
 
 ## Implementation
 
