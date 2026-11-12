@@ -218,7 +218,7 @@ fn sketch_rejects_unimplemented_and_unknown_algorithms() {
     ] {
         t.failure(
             &["sketch", "-a", name, "-k", "3", "good.fa", "-o", "out"],
-            &format!("{name} is not implemented yet; implemented: minhash, fracminhash"),
+            &format!("{name} is not implemented yet; implemented: minhash, fracminhash, aiips"),
         );
     }
     for name in ["MinHash", "sha1", ""] {
@@ -981,7 +981,7 @@ fn compare_halts_unless_both_sketches_are_implemented() {
         t.failure(
             &["compare", "a.aiips", "other.aiips"],
             &format!(
-                "comparison requires two sketches of one algorithm, minhash or fracminhash (a.aiips: minhash, other.aiips: {name})"
+                "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips (a.aiips: minhash, other.aiips: {name})"
             ),
         );
         t.failure(
@@ -993,7 +993,7 @@ fn compare_halts_unless_both_sketches_are_implemented() {
     t.write("other.aiips", b"aiips-sketch v1 algorithm=bottomk\n");
     t.failure(
         &["compare", "good.fa", "other.aiips", "-k", "3"],
-        "comparison requires two sketches of one algorithm, minhash or fracminhash (good.fa: fasta/fastq, other.aiips: bottomk)",
+        "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips (good.fa: fasta/fastq, other.aiips: bottomk)",
     );
     t.write("other.aiips", b"aiips-sketch v1 algorithm=hyperloglog\n");
     t.failure(
@@ -2014,7 +2014,7 @@ fn compare_halts_on_mixed_algorithms_and_fracminhash_mismatches() {
     t.sketch("good.fa", "m", &["-k", "3"]);
     t.failure(
         &["compare", "m.aiips", "f.aiips"],
-        "comparison requires two sketches of one algorithm, minhash or fracminhash (m.aiips: minhash, f.aiips: fracminhash)",
+        "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips (m.aiips: minhash, f.aiips: fracminhash)",
     );
     t.failure(
         &["compare", "f.aiips", "m.aiips"],
@@ -2101,4 +2101,825 @@ fn compare_reports_saturated_fracminhash_size_instead_of_panicking() {
         );
         assert!(output.stdout.is_empty());
     }
+}
+
+const AIIPS_BUILD: &str = "input\tanchor_occurrences\tdistinct_anchors\tunique_anchors\tprobe_occurrences\tdistinct_probes\tambiguous_kmers\tfile_bytes";
+const AIIPS_DIAGNOSTICS: &str = "input_a\tinput_b\tglobal_a\tglobal_b\tglobal_shared\tmax_containment\tputative_ani\tshared_anchors\trepeated_anchors\tbreaks_order\tbreaks_gap\tbreaks_ratio\tcandidate_blocks\toverlapping_blocks\trejected_few_hits\trejected_disorder\taccepted_blocks\tmapping_hits\tscoring_a\tscoring_b\tscoring_shared\texcluded_boundary_overlap\texcluded_repeats\tcovered_bases_a\tcovered_bases_b\taf_containment_a\taf_containment_b\tjaccard_status\tcontainment_status\tani_status\taf_status";
+
+/// The comparison and diagnostics rows `compare` should print for two aiips
+/// sketch files, computed through the library with `config`.
+fn aiips_rows(
+    t: &Workspace,
+    a: &str,
+    b: &str,
+    config: &aiips::sketch::aiips::LocalConfig,
+) -> String {
+    let c = aiips::sketch::aiips::compare(&load_aiips(t, a), &load_aiips(t, b), config).unwrap();
+    let v = |x: Option<f64>| x.map_or_else(|| "-1".to_string(), |x| format!("{x:.6}"));
+    let (g, l) = (&c.global, &c.local);
+    let (n, m) = (&l.counts, &l.counts.matching);
+    let counts = [
+        m.shared_anchors,
+        m.repeated_anchors,
+        m.breaks_order,
+        m.breaks_gap,
+        m.breaks_ratio,
+        m.candidate_blocks,
+        m.overlapping_blocks,
+        n.rejected_few_hits,
+        n.rejected_disorder,
+        n.accepted_blocks,
+        n.mapping_hits,
+        n.scoring_a,
+        n.scoring_b,
+        n.scoring_shared,
+        n.excluded_boundary_overlap,
+        n.excluded_repeats,
+        n.covered_bases_a,
+        n.covered_bases_b,
+    ]
+    .map(|x| x.to_string())
+    .join("\t");
+    format!(
+        "{METRICS}\n{a}\t{b}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\n\n{AIIPS_DIAGNOSTICS}\n{a}\t{b}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{counts}\t{}\t{}\testimated\testimated\t{}\t{}\n",
+        g.jaccard,
+        g.containment_a_in_b,
+        g.containment_b_in_a,
+        v(l.ani),
+        v(l.af_a),
+        v(l.af_b),
+        g.ani_containment_a_in_b,
+        g.ani_containment_b_in_a,
+        g.global_a,
+        g.global_b,
+        g.global_shared,
+        g.max_containment,
+        g.putative_ani,
+        v(c.af_containment_a),
+        v(c.af_containment_b),
+        l.ani_status.name(),
+        l.af_status.name(),
+    )
+}
+
+fn aiips(t: &Workspace, input: &str, name: &str, extra: &[&str]) -> String {
+    let mut args = vec!["sketch", "-a", "aiips", input, "-o", name];
+    args.extend(extra);
+    t.success(&args)
+}
+
+/// Fixed-seed xorshift64* bases, long enough for the default probe k.
+fn random_genome(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            b"ACGT"[(state.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 62) as usize]
+        })
+        .collect()
+}
+
+fn write_fasta(t: &Workspace, name: &str, sequence: &[u8]) {
+    let mut fasta = b">g\n".to_vec();
+    fasta.extend_from_slice(sequence);
+    fasta.push(b'\n');
+    t.write(name, &fasta);
+}
+
+fn load_aiips(t: &Workspace, name: &str) -> aiips::sketch::aiips::AiipsSketch {
+    match aiips::sketch::parse(&fs::read(t.path(name)).unwrap()).unwrap() {
+        aiips::sketch::Sketch::Aiips(sketch) => *sketch,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn sketch_aiips_reports_diagnostics_and_matches_library() {
+    use aiips::sketch::aiips::{AiipsParams, AiipsSketch};
+    let t = Workspace::new();
+    let flags = [
+        "--anchor-k",
+        "5",
+        "--anchor-scaled",
+        "2",
+        "--probe-k",
+        "3",
+        "--probe-scaled",
+        "1",
+    ];
+    let stdout = aiips(&t, "good.fa", "a", &flags);
+    let bytes = fs::read(t.path("a.aiips")).unwrap();
+    // One anchor; 7 valid 3-mers, 3 distinct canonical, 2 windows touching N.
+    assert_eq!(
+        stdout,
+        format!(
+            "{STATS}\ngood.fa\t2\t13\t2\t3\t7\n\n{AIIPS_BUILD}\ngood.fa\t1\t1\t1\t7\t3\t2\t325\noutput\ta.aiips\n"
+        )
+    );
+    assert_eq!(bytes.len(), 325);
+    let k = |k| std::num::NonZeroUsize::new(k).unwrap();
+    let params = AiipsParams::new(k(5), 2, k(3), 1, 42).unwrap();
+    let library = AiipsSketch::build(include_bytes!("fixtures/sample.fa").as_slice(), params);
+    assert_eq!(bytes, library.unwrap().to_bytes());
+    assert!(bytes.starts_with(
+        b"aiips-sketch v1 algorithm=aiips anchor_k=5 anchor_scaled=2 probe_k=3 probe_scaled=1 seed=42 hash=murmur3-fmix64 canonical=true body_bytes=133\nrecords=2 bases=13 non_acgt_bases=2 valid_kmers=7\n"
+    ));
+    // Identical sequences in other formats give identical files.
+    for input in ["good.fq", "good.fa.gz", "good.fq.gz"] {
+        aiips(&t, input, "copy", &flags);
+        assert_eq!(fs::read(t.path("copy.aiips")).unwrap(), bytes, "{input}");
+        fs::remove_file(t.path("copy.aiips")).unwrap();
+    }
+}
+
+#[test]
+fn sketch_aiips_defaults_to_k_21_15_and_scaled_125() {
+    let t = Workspace::new();
+    write_fasta(&t, "g.fa", &random_genome(1, 3000));
+    let stdout = aiips(&t, "g.fa", "g", &[]);
+    let bytes = fs::read(t.path("g.aiips")).unwrap();
+    assert!(bytes.starts_with(
+        b"aiips-sketch v1 algorithm=aiips anchor_k=21 anchor_scaled=125 probe_k=15 probe_scaled=125 seed=42 hash=murmur3-fmix64 canonical=true body_bytes="
+    ));
+    let sketch = load_aiips(&t, "g.aiips");
+    let anchors = sketch.anchors();
+    assert!(!anchors.is_empty());
+    assert_eq!(
+        stdout,
+        format!(
+            "{STATS}\ng.fa\t1\t3000\t0\t15\t2986\n\n{AIIPS_BUILD}\ng.fa\t{}\t{}\t{}\t{}\t{}\t0\t{}\noutput\tg.aiips\n",
+            anchors.len(),
+            anchors.hashes.len(),
+            anchors.unique(),
+            sketch.probes().len(),
+            sketch.global_probes().len(),
+            bytes.len()
+        )
+    );
+    aiips(
+        &t,
+        "g.fa",
+        "explicit",
+        &[
+            "--anchor-k",
+            "21",
+            "--anchor-scaled",
+            "125",
+            "--probe-k",
+            "15",
+            "--probe-scaled",
+            "125",
+            "--seed",
+            "42",
+        ],
+    );
+    assert_eq!(fs::read(t.path("explicit.aiips")).unwrap(), bytes);
+}
+
+#[test]
+fn compare_aiips_prints_positional_estimates_and_diagnostics() {
+    let t = Workspace::new();
+    let genome = random_genome(2, 3000);
+    write_fasta(&t, "g.fa", &genome);
+    write_fasta(&t, "sub.fa", &genome[500..2500]);
+    let flags = ["--probe-k", "15", "--probe-scaled", "1"];
+    aiips(&t, "g.fa", "g", &flags);
+    aiips(&t, "sub.fa", "s", &flags);
+    let config = aiips::sketch::aiips::LocalConfig::default();
+    let c = aiips::sketch::aiips::compare(
+        &load_aiips(&t, "s.aiips"),
+        &load_aiips(&t, "g.aiips"),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(
+        c.global.containment_a_in_b, 1.0,
+        "a subsequence is contained"
+    );
+    assert_eq!(c.local.ani, Some(1.0), "identical where shared");
+    assert!(c.local.af_a.unwrap() > c.local.af_b.unwrap());
+    let stdout = t.success(&["compare", "s.aiips", "g.aiips"]);
+    assert_eq!(
+        stdout,
+        format!(
+            "{STATS}\ns.aiips\t1\t2000\t0\t15\t1986\ng.aiips\t1\t3000\t0\t15\t2986\n\n{}",
+            aiips_rows(&t, "s.aiips", "g.aiips", &config)
+        )
+    );
+    // Sequence inputs are sketched with the sketch's (or the given) parameters.
+    let values = |out: &str| -> Vec<String> {
+        out.lines()
+            .filter(|line| !line.is_empty() && !line.starts_with("input"))
+            .skip(2)
+            .map(|line| line.splitn(3, '\t').nth(2).unwrap().to_owned())
+            .collect()
+    };
+    for args in [
+        vec!["compare", "s.aiips", "g.fa"],
+        vec!["compare", "sub.fa", "g.aiips", "--probe-k", "15"],
+        vec![
+            "compare",
+            "sub.fa",
+            "g.fa",
+            "-a",
+            "aiips",
+            "--probe-k",
+            "15",
+            "--probe-scaled",
+            "1",
+        ],
+    ] {
+        assert_eq!(values(&t.success(&args)), values(&stdout), "{args:?}");
+    }
+}
+
+#[test]
+fn sketch_validates_aiips_parameters() {
+    let t = Workspace::new();
+    for (args, message) in [
+        (vec!["--probe-k", "4"], "odd integer from 1 to 31, got 4"),
+        (vec!["--probe-k", "33"], "odd integer from 1 to 31, got 33"),
+        (
+            vec!["--probe-k", "0"],
+            "probe k-mer length must be an odd integer",
+        ),
+        (
+            vec!["--probe-k", "x"],
+            "probe k-mer length must be an odd integer",
+        ),
+        (
+            vec!["--probe-k"],
+            "probe k-mer length must be an odd integer",
+        ),
+        (
+            vec!["--probe-scaled", "0"],
+            "probe scaled must be an integer from 1",
+        ),
+        (
+            vec!["--probe-scaled", "18446744073709551616"],
+            "probe scaled must be an integer from 1",
+        ),
+        (
+            vec!["--probe-k", "3", "--probe-k", "3"],
+            "probe k-mer length may only be specified once",
+        ),
+        (
+            vec!["--probe-scaled", "1", "--probe-scaled", "1"],
+            "probe scaled may only be specified once",
+        ),
+        (
+            vec!["-k", "3"],
+            "-k/--kmer-size does not apply to aiips; use --probe-k",
+        ),
+        (
+            vec!["-s", "8"],
+            "-s/--num-hashes applies only to minhash, not aiips",
+        ),
+        (
+            vec!["--scaled", "8"],
+            "--scaled applies only to fracminhash, not aiips; use --probe-scaled",
+        ),
+    ] {
+        let mut full = vec!["sketch", "good.fa", "-o", "out", "-a", "aiips"];
+        full.extend(args);
+        t.failure(&full, message);
+    }
+    for (args, message) in [
+        (
+            vec!["-a", "minhash", "--probe-k", "3"],
+            "--probe-k applies only to aiips, not minhash",
+        ),
+        (
+            vec!["--probe-scaled", "3"],
+            "--probe-scaled applies only to aiips, not minhash",
+        ),
+        (
+            vec!["-a", "fracminhash", "--probe-k", "3"],
+            "--probe-k applies only to aiips, not fracminhash",
+        ),
+    ] {
+        let mut full = vec!["sketch", "good.fa", "-o", "out"];
+        full.extend(args);
+        t.failure(&full, message);
+    }
+    assert!(!t.path("out.aiips").exists());
+    // The default probe k is longer than every fixture record.
+    t.failure(
+        &["sketch", "-a", "aiips", "good.fa", "-o", "none"],
+        "no valid k-mers of length 15",
+    );
+    assert!(!t.path("none.aiips").exists());
+}
+
+#[test]
+fn compare_aiips_options_and_parameters_must_match() {
+    let t = Workspace::new();
+    aiips(
+        &t,
+        "good.fa",
+        "a",
+        &["--probe-k", "3", "--probe-scaled", "1"],
+    );
+    for (args, message) in [
+        (
+            vec!["--probe-k", "5"],
+            "--probe-k 5 does not match probe_k=3 recorded in a.aiips",
+        ),
+        (
+            vec!["--probe-scaled", "2"],
+            "--probe-scaled 2 does not match probe_scaled=1 recorded in a.aiips",
+        ),
+        (
+            vec!["--seed", "1"],
+            "--seed 1 does not match seed=42 recorded in a.aiips",
+        ),
+        (
+            vec!["-a", "fracminhash"],
+            "-a fracminhash does not match algorithm=aiips recorded in a.aiips",
+        ),
+        (vec!["-k", "3"], "-k/--kmer-size does not apply to aiips"),
+        (
+            vec!["--scaled", "1"],
+            "--scaled applies only to fracminhash, not aiips",
+        ),
+    ] {
+        for pair in [["a.aiips", "good.fq"], ["good.fq", "a.aiips"]] {
+            let mut full = vec!["compare", pair[0], pair[1]];
+            full.extend(args.iter().copied());
+            t.failure(&full, message);
+        }
+    }
+    t.failure(
+        &["compare", "good.fa", "good.fq", "--probe-k", "3"],
+        "--probe-k applies only to aiips, not minhash",
+    );
+    aiips(
+        &t,
+        "good.fa",
+        "k5",
+        &["--probe-k", "5", "--probe-scaled", "1"],
+    );
+    aiips(
+        &t,
+        "good.fa",
+        "s7",
+        &["--probe-k", "3", "--probe-scaled", "1", "--seed", "7"],
+    );
+    t.failure(
+        &["compare", "a.aiips", "k5.aiips"],
+        "sketch parameters differ: probe_k (3 vs 5); re-sketch with identical parameters",
+    );
+    t.failure(
+        &["compare", "a.aiips", "s7.aiips"],
+        "sketch parameters differ: seed (42 vs 7)",
+    );
+    frac(&t, "good.fa", "f", &["-k", "3", "--scaled", "1"]);
+    t.failure(
+        &["compare", "a.aiips", "f.aiips"],
+        "minhash, fracminhash or aiips (a.aiips: aiips, f.aiips: fracminhash)",
+    );
+}
+
+#[test]
+fn empty_aiips_sketch_is_written_with_a_warning_and_cannot_be_compared() {
+    let t = Workspace::new();
+    let flags = ["--probe-k", "3", "--probe-scaled", "18446744073709551615"];
+    let mut args = vec!["sketch", "-a", "aiips", "good.fa", "-o", "e"];
+    args.extend(flags);
+    let output = t.run(&args);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\ngood.fa\t0\t0\t0\t0\t0\t2\t"), "{stdout}");
+    assert!(String::from_utf8(output.stderr).unwrap().contains(
+        "aiips: warning: e.aiips: no probe k-mer hash is at or below the probe_scaled=18446744073709551615 threshold; the sketch is empty and cannot be compared"
+    ));
+    assert!(load_aiips(&t, "e.aiips").global_probes().is_empty());
+    for pair in [["e.aiips", "e.aiips"], ["e.aiips", "good.fq"]] {
+        t.failure(
+            &["compare", pair[0], pair[1]],
+            "e.aiips: aiips sketch has no probe hash values; containment is undefined; use a smaller --probe-scaled",
+        );
+    }
+}
+
+#[test]
+fn compare_rejects_corrupt_aiips_sketches() {
+    let t = Workspace::new();
+    aiips(
+        &t,
+        "good.fa",
+        "a",
+        &["--probe-k", "3", "--probe-scaled", "1"],
+    );
+    let bytes = fs::read(t.path("a.aiips")).unwrap();
+    let header_end = bytes.iter().position(|&b| b == b'\n').unwrap();
+    let header = std::str::from_utf8(&bytes[..header_end]).unwrap();
+    let declared: u64 = header
+        .rsplit_once("body_bytes=")
+        .unwrap()
+        .1
+        .parse()
+        .unwrap();
+    let mut flipped = bytes.clone();
+    *flipped.last_mut().unwrap() ^= 1;
+    t.write("flipped.aiips", &flipped);
+    t.failure(
+        &["compare", "flipped.aiips", "a.aiips"],
+        "checksum mismatch",
+    );
+    t.write("short.aiips", &bytes[..bytes.len() - 1]);
+    t.failure(
+        &["compare", "short.aiips", "a.aiips"],
+        &format!(
+            "short.aiips: invalid sketch: expected body_bytes={declared}, found {}",
+            declared - 1
+        ),
+    );
+    // A huge declared size saturates the read bound instead of overflowing.
+    let mut huge = header
+        .replacen(
+            &format!("body_bytes={declared}"),
+            "body_bytes=18446744073709551615",
+            1,
+        )
+        .into_bytes();
+    huge.extend_from_slice(&bytes[header_end..]);
+    t.write("huge.aiips", &huge);
+    t.failure(
+        &["compare", "huge.aiips", "a.aiips"],
+        &format!("expected body_bytes=18446744073709551615, found {declared}"),
+    );
+    // Without the .aiips extension, the header still identifies a sketch.
+    t.write("renamed.sketch", &bytes);
+    t.success(&["compare", "renamed.sketch", "a.aiips"]);
+}
+
+#[test]
+fn sketch_validates_aiips_anchor_parameters() {
+    let t = Workspace::new();
+    for (args, message) in [
+        (
+            vec!["--anchor-k", "4"],
+            "anchor k-mer length must be an odd integer from 1 to 31, got 4",
+        ),
+        (vec!["--anchor-k", "33"], "odd integer from 1 to 31, got 33"),
+        (
+            vec!["--anchor-k", "0"],
+            "anchor k-mer length must be an odd integer",
+        ),
+        (
+            vec!["--anchor-k"],
+            "anchor k-mer length must be an odd integer",
+        ),
+        (
+            vec!["--anchor-scaled", "0"],
+            "anchor scaled must be an integer from 1",
+        ),
+        (
+            vec!["--anchor-scaled", "-1"],
+            "anchor scaled must be an integer from 1",
+        ),
+        (
+            vec!["--anchor-k", "3", "--anchor-k", "3"],
+            "anchor k-mer length may only be specified once",
+        ),
+        (
+            vec!["--anchor-scaled", "1", "--anchor-scaled", "1"],
+            "anchor scaled may only be specified once",
+        ),
+    ] {
+        let mut full = vec![
+            "sketch",
+            "good.fa",
+            "-o",
+            "out",
+            "-a",
+            "aiips",
+            "--probe-k",
+            "3",
+        ];
+        full.extend(args);
+        t.failure(&full, message);
+    }
+    t.failure(
+        &[
+            "sketch",
+            "good.fa",
+            "-o",
+            "out",
+            "-a",
+            "aiips",
+            "--probe-k",
+            "15",
+            "--anchor-k",
+            "15",
+        ],
+        "anchor k-mer length (15) must exceed the probe k-mer length (15)",
+    );
+    for (algorithm, flag) in [
+        ("minhash", "--anchor-k"),
+        ("fracminhash", "--anchor-scaled"),
+    ] {
+        t.failure(
+            &["sketch", "good.fa", "-o", "out", "-a", algorithm, flag, "3"],
+            &format!("{flag} applies only to aiips, not {algorithm}"),
+        );
+    }
+    assert!(!t.path("out.aiips").exists());
+}
+
+#[test]
+fn compare_aiips_anchor_parameters_must_match() {
+    let t = Workspace::new();
+    aiips(
+        &t,
+        "good.fa",
+        "a",
+        &["--probe-k", "3", "--probe-scaled", "1"],
+    );
+    for (args, message) in [
+        (
+            vec!["--anchor-k", "5"],
+            "--anchor-k 5 does not match anchor_k=21 recorded in a.aiips",
+        ),
+        (
+            vec!["--anchor-scaled", "2"],
+            "--anchor-scaled 2 does not match anchor_scaled=125 recorded in a.aiips",
+        ),
+    ] {
+        for pair in [["a.aiips", "good.fq"], ["good.fq", "a.aiips"]] {
+            let mut full = vec!["compare", pair[0], pair[1]];
+            full.extend(args.iter().copied());
+            t.failure(&full, message);
+        }
+    }
+    // Probe parameters agree, anchors differ: refused, naming each field.
+    aiips(
+        &t,
+        "good.fa",
+        "b",
+        &[
+            "--probe-k",
+            "3",
+            "--probe-scaled",
+            "1",
+            "--anchor-k",
+            "19",
+            "--anchor-scaled",
+            "7",
+        ],
+    );
+    t.failure(
+        &["compare", "a.aiips", "b.aiips"],
+        "sketch parameters differ: anchor_k (21 vs 19), anchor_scaled (125 vs 7); re-sketch with identical parameters",
+    );
+    t.failure(
+        &["compare", "good.fa", "good.fq", "--anchor-k", "3"],
+        "--anchor-k applies only to aiips, not minhash",
+    );
+    // An option equal to the recorded value is accepted even when it would
+    // conflict with a default (here anchor_k=5 against the default probe_k=15).
+    aiips(
+        &t,
+        "good.fa",
+        "small",
+        &["--anchor-k", "5", "--probe-k", "3", "--probe-scaled", "1"],
+    );
+    t.success(&["compare", "small.aiips", "good.fq", "--anchor-k", "5"]);
+}
+
+#[test]
+fn compare_aiips_threshold_flags_change_results() {
+    use aiips::sketch::aiips::LocalConfig;
+    let t = Workspace::new();
+    let genome = random_genome(3, 30_000);
+    write_fasta(&t, "g.fa", &genome);
+    let mut mutated = genome.clone();
+    for base in mutated.iter_mut().step_by(41) {
+        *base = if *base == b'A' { b'C' } else { b'A' };
+    }
+    write_fasta(&t, "m.fa", &mutated);
+    let dense = ["--anchor-scaled", "20", "--probe-scaled", "10"];
+    aiips(&t, "g.fa", "g", &dense);
+    aiips(&t, "m.fa", "m", &dense);
+    let rows = |out: &str| out.split_once("\n\n").unwrap().1.to_owned();
+    for (flags, config) in [
+        (vec![], LocalConfig::default()),
+        (
+            vec!["--min-block-span", "2000", "--max-anchor-gap", "5000"],
+            LocalConfig {
+                min_block_span: 2000,
+                max_anchor_gap: 5000,
+                ..LocalConfig::default()
+            },
+        ),
+        (
+            vec!["--max-gap-ratio", "1.5", "--min-order-fraction", "0.95"],
+            LocalConfig {
+                max_gap_ratio: 1.5,
+                min_order_fraction: 0.95,
+                ..LocalConfig::default()
+            },
+        ),
+        (
+            vec!["--min-mapping-hits", "1000000"],
+            LocalConfig {
+                min_mapping_hits: 1_000_000,
+                ..LocalConfig::default()
+            },
+        ),
+        (
+            vec!["--min-scoring-probes", "1000000"],
+            LocalConfig {
+                min_scoring_probes: 1_000_000,
+                ..LocalConfig::default()
+            },
+        ),
+    ] {
+        let mut args = vec!["compare", "g.aiips", "m.aiips"];
+        args.extend(&flags);
+        let output = t.run(&args);
+        assert!(output.status.success(), "{flags:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            rows(&stdout),
+            aiips_rows(&t, "g.aiips", "m.aiips", &config),
+            "{flags:?}"
+        );
+    }
+    let unsupported = t.run(&[
+        "compare",
+        "g.aiips",
+        "m.aiips",
+        "--min-mapping-hits",
+        "1000000",
+    ]);
+    let stdout = String::from_utf8(unsupported.stdout).unwrap();
+    assert!(
+        stdout.contains("\tno_supported_mapping\tno_supported_mapping\n"),
+        "{stdout}"
+    );
+    let thin = t.run(&[
+        "compare",
+        "g.aiips",
+        "m.aiips",
+        "--min-scoring-probes",
+        "1000000",
+    ]);
+    let stdout = String::from_utf8(thin.stdout).unwrap();
+    assert!(
+        stdout.contains("\tinsufficient_evidence\testimated\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn compare_validates_aiips_threshold_flags() {
+    let t = Workspace::new();
+    aiips(
+        &t,
+        "good.fa",
+        "a",
+        &["--probe-k", "3", "--probe-scaled", "1"],
+    );
+    for (args, message) in [
+        (
+            vec!["--min-block-span", "0"],
+            "min block span must be an integer from 1",
+        ),
+        (
+            vec!["--min-block-span", "4294967296"],
+            "min block span must be",
+        ),
+        (
+            vec!["--max-anchor-gap", "0"],
+            "max anchor gap must be an integer from 1",
+        ),
+        (
+            vec!["--max-gap-ratio", "0.5"],
+            "max gap ratio must be a finite number of at least 1",
+        ),
+        (vec!["--max-gap-ratio", "inf"], "max gap ratio must be"),
+        (vec!["--max-gap-ratio", "NaN"], "max gap ratio must be"),
+        (
+            vec!["--min-mapping-hits", "1"],
+            "min mapping hits must be an integer from 2",
+        ),
+        (
+            vec!["--min-order-fraction", "1.5"],
+            "min order fraction must be a number from 0 to 1",
+        ),
+        (
+            vec!["--min-order-fraction", "-0.1"],
+            "min order fraction must be",
+        ),
+        (
+            vec!["--min-scoring-probes", "0"],
+            "min scoring probes must be an integer from 1",
+        ),
+        (
+            vec!["--min-scoring-probes", "x"],
+            "min scoring probes must be",
+        ),
+        (vec!["--min-scoring-probes"], "min scoring probes must be"),
+        (
+            vec!["--min-block-span", "5", "--min-block-span", "5"],
+            "min block span may only be specified once",
+        ),
+    ] {
+        let mut full = vec!["compare", "a.aiips", "a.aiips"];
+        full.extend(args);
+        t.failure(&full, message);
+    }
+    // Thresholds belong to aiips comparisons only.
+    t.sketch("good.fa", "m", &["-k", "3"]);
+    t.failure(
+        &["compare", "m.aiips", "m.aiips", "--max-gap-ratio", "3"],
+        "--max-gap-ratio applies only to aiips, not minhash",
+    );
+    t.failure(
+        &["compare", "good.fa", "good.fq", "--min-block-span", "5"],
+        "--min-block-span applies only to aiips, not minhash",
+    );
+    t.failure(
+        &[
+            "compare",
+            "good.fa",
+            "good.fq",
+            "-a",
+            "fracminhash",
+            "--min-mapping-hits",
+            "5",
+        ],
+        "--min-mapping-hits applies only to aiips, not fracminhash",
+    );
+    t.failure(
+        &[
+            "sketch",
+            "good.fa",
+            "-o",
+            "x",
+            "-a",
+            "aiips",
+            "--min-block-span",
+            "5",
+        ],
+        "unknown option: --min-block-span",
+    );
+    // Accepted with aiips sequence inputs too.
+    t.success(&[
+        "compare",
+        "good.fa",
+        "good.fq",
+        "-a",
+        "aiips",
+        "--probe-k",
+        "3",
+        "--probe-scaled",
+        "1",
+        "--min-block-span",
+        "5",
+    ]);
+}
+
+#[test]
+fn af_containment_above_one_is_reported_with_a_warning() {
+    let t = Workspace::new();
+    let genome = random_genome(4, 30_000);
+    write_fasta(&t, "g.fa", &genome);
+    let dense = ["--anchor-scaled", "20", "--probe-scaled", "10"];
+    aiips(&t, "g.fa", "g", &dense);
+    // Different substitution patterns: C / q lands on either side of 1.
+    let (mut above, mut not_above) = (0, 0);
+    for step in [23, 29, 31, 37, 41, 43] {
+        let mut mutated = genome.clone();
+        for base in mutated.iter_mut().step_by(step) {
+            *base = if *base == b'T' { b'G' } else { b'T' };
+        }
+        write_fasta(&t, "m.fa", &mutated);
+        let output = t.run(&["compare", "g.aiips", "m.fa"]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let row: Vec<&str> = stdout.lines().last().unwrap().split('\t').collect();
+        for (column, name) in [(25, "af_containment_a"), (26, "af_containment_b")] {
+            let value: f64 = row[column].parse().unwrap();
+            assert_eq!(
+                stderr.contains(&format!("aiips: warning: {name} is ")),
+                value > 1.0,
+                "step {step}: {name}={value}; stderr: {stderr}"
+            );
+            if value > 1.0 {
+                above += 1;
+            } else {
+                not_above += 1;
+            }
+        }
+    }
+    assert!(
+        above > 0 && not_above > 0,
+        "both cases exercised: {above} {not_above}"
+    );
 }

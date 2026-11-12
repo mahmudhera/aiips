@@ -101,7 +101,8 @@ impl FracMinHashParams {
     }
 }
 
-fn max_hash(scaled: u64) -> u64 {
+/// floor((2^64 − 1) / scaled), the largest retained hash value.
+pub(crate) fn max_hash(scaled: u64) -> u64 {
     u64::MAX / scaled
 }
 
@@ -145,16 +146,19 @@ impl FracMinHasher {
         }
     }
 
+    /// Hashes one k-mer occurrence; returns whether its hash was retained.
     #[inline]
-    pub fn insert(&mut self, kmer: u64) {
+    pub fn insert(&mut self, kmer: u64) -> bool {
         let hash = fmix64(kmer ^ self.seed);
-        if hash <= self.max_hash {
+        let kept = hash <= self.max_hash;
+        if kept {
             self.hashes.push(hash);
             if self.hashes.len() >= self.compact_at {
                 self.compact();
                 self.compact_at = (2 * self.hashes.len()).max(MIN_COMPACTION);
             }
         }
+        kept
     }
 
     fn compact(&mut self) {

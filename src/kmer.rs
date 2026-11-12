@@ -101,11 +101,11 @@ impl<'a> CanonicalKmers<'a> {
     }
 }
 
-impl Iterator for CanonicalKmers<'_> {
-    type Item = u64;
-
+impl CanonicalKmers<'_> {
+    /// Moves to the next valid window and returns its forward and
+    /// reverse-complement codes; the window starts at `next_base - k`.
     #[inline]
-    fn next(&mut self) -> Option<u64> {
+    fn advance(&mut self) -> Option<(u64, u64)> {
         while let Some(&base) = self.sequence.get(self.next_base) {
             self.next_base += 1;
             let Some(code) = base_code(base) else {
@@ -116,12 +116,72 @@ impl Iterator for CanonicalKmers<'_> {
             self.reverse = (self.reverse >> 2) | ((3 - code) << self.shift);
             self.valid_run += 1;
             if self.valid_run >= self.k {
-                return Some(self.forward.min(self.reverse));
+                return Some((self.forward, self.reverse));
             }
         }
         None
     }
 }
+
+impl Iterator for CanonicalKmers<'_> {
+    type Item = u64;
+
+    #[inline]
+    fn next(&mut self) -> Option<u64> {
+        self.advance()
+            .map(|(forward, reverse)| forward.min(reverse))
+    }
+}
+
+/// One canonical k-mer occurrence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrandedKmer {
+    /// Zero-based start within the record.
+    pub position: usize,
+    /// Canonical 2-bit code, as yielded by [`CanonicalKmers`].
+    pub code: u64,
+    /// True when the reverse complement is the canonical form (strand 1).
+    /// A reverse-complement palindrome (even k only) counts as forward.
+    pub reverse: bool,
+}
+
+/// [`CanonicalKmers`] with each window's position and strand.
+pub struct StrandedKmers<'a>(CanonicalKmers<'a>);
+
+impl<'a> StrandedKmers<'a> {
+    /// Returns `None` when `k` exceeds [`MAX_PACKED_K`].
+    pub fn new(sequence: &'a [u8], k: NonZeroUsize) -> Option<Self> {
+        CanonicalKmers::new(sequence, k).map(Self)
+    }
+}
+
+impl Iterator for StrandedKmers<'_> {
+    type Item = StrandedKmer;
+
+    #[inline]
+    fn next(&mut self) -> Option<StrandedKmer> {
+        let (forward, reverse) = self.0.advance()?;
+        Some(StrandedKmer {
+            position: self.0.next_base - self.0.k,
+            code: forward.min(reverse),
+            reverse: reverse < forward,
+        })
+    }
+}
+
+/// 2-bit code of each byte (A/C/G/T in either case); 4 for every other byte.
+pub const CODES: [u8; 256] = {
+    let mut codes = [4u8; 256];
+    codes[b'A' as usize] = 0;
+    codes[b'a' as usize] = 0;
+    codes[b'C' as usize] = 1;
+    codes[b'c' as usize] = 1;
+    codes[b'G' as usize] = 2;
+    codes[b'g' as usize] = 2;
+    codes[b'T' as usize] = 3;
+    codes[b't' as usize] = 3;
+    codes
+};
 
 #[cfg(test)]
 mod tests {
@@ -152,6 +212,102 @@ mod tests {
                 encode(window).min(encode(&reverse_complement))
             })
             .collect()
+    }
+
+    /// Independent baseline: (position, canonical code, reverse) of every
+    /// valid window, each encoded from scratch.
+    fn naive_stranded(sequence: &[u8], k: usize) -> Vec<(usize, u64, bool)> {
+        let encode = |window: &[u8]| -> u64 {
+            window
+                .iter()
+                .fold(0, |code, &b| (code << 2) | base_code(b).unwrap())
+        };
+        sequence
+            .windows(k)
+            .enumerate()
+            .filter(|(_, window)| window.iter().all(|b| base_code(*b).is_some()))
+            .map(|(position, window)| {
+                let reverse_complement: Vec<u8> = window
+                    .iter()
+                    .rev()
+                    .map(|b| match b.to_ascii_uppercase() {
+                        b'A' => b'T',
+                        b'C' => b'G',
+                        b'G' => b'C',
+                        _ => b'A',
+                    })
+                    .collect();
+                let (forward, reverse) = (encode(window), encode(&reverse_complement));
+                (position, forward.min(reverse), reverse < forward)
+            })
+            .collect()
+    }
+
+    fn stranded(sequence: &[u8], k: usize) -> Vec<(usize, u64, bool)> {
+        StrandedKmers::new(sequence, NonZeroUsize::new(k).unwrap())
+            .unwrap()
+            .map(|hit| (hit.position, hit.code, hit.reverse))
+            .collect()
+    }
+
+    #[test]
+    fn stranded_kmers_agree_with_naive_baseline() {
+        let alphabet = b"AcGtN";
+        for code in 0..5_usize.pow(7) {
+            let mut value = code;
+            let mut sequence = [0; 7];
+            for base in &mut sequence {
+                *base = alphabet[value % 5];
+                value /= 5;
+            }
+            for k in 1..=8 {
+                assert_eq!(
+                    stranded(&sequence, k),
+                    naive_stranded(&sequence, k),
+                    "{sequence:?} k={k}"
+                );
+            }
+        }
+        let long = b"ACGTTGCAACGTTGCAACGTTGCAACGTTGCAGGNACGTTGCAACGTTGCAACGTTGCAACGTTGCAT";
+        for k in [31, 32] {
+            assert_eq!(stranded(long, k), naive_stranded(long, k));
+        }
+        assert!(StrandedKmers::new(long, NonZeroUsize::new(33).unwrap()).is_none());
+    }
+
+    #[test]
+    fn strand_flips_and_positions_mirror_under_reverse_complement() {
+        // Odd k: no palindromes, so every occurrence flips strand.
+        let forward = b"GATTACAGGCTTAACGTTAGCCATG";
+        let reverse_complement: Vec<u8> = forward
+            .iter()
+            .rev()
+            .map(|b| match b {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                _ => b'A',
+            })
+            .collect();
+        let k = 5;
+        let a = stranded(forward, k);
+        let mut b = stranded(&reverse_complement, k);
+        b.reverse();
+        for ((pa, ca, ra), (pb, cb, rb)) in a.into_iter().zip(b) {
+            assert_eq!(ca, cb);
+            assert_eq!(ra, !rb);
+            assert_eq!(pa, forward.len() - k - pb);
+        }
+    }
+
+    #[test]
+    fn code_table_matches_base_code() {
+        for byte in 0..=255u8 {
+            assert_eq!(
+                base_code(byte),
+                (CODES[byte as usize] < 4).then(|| u64::from(CODES[byte as usize]))
+            );
+        }
     }
 
     fn canonical(sequence: &[u8], k: usize) -> Vec<u64> {

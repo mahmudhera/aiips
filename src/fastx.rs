@@ -46,6 +46,27 @@ pub fn summarize_with<R: Read + Send>(
     Ok(summary)
 }
 
+/// Like [`summarize_with`], but `visit` counts each record's valid k-mers and
+/// non-ACGT bases itself, returning (kmers, non_acgt), so a caller that
+/// already scans the sequence avoids two extra passes per record.
+pub fn summarize_counted<R: Read + Send>(
+    input: R,
+    mut visit: impl FnMut(&[u8]) -> (u64, u64),
+) -> Result<Summary, ParseError> {
+    let mut reader = parse_fastx_reader(input)?;
+    let mut summary = Summary::default();
+    while let Some(record) = reader.next() {
+        let record = record?;
+        let sequence = record.seq();
+        summary.records += 1;
+        summary.bases += sequence.len() as u64;
+        let (kmers, non_acgt) = visit(&sequence);
+        summary.kmers += kmers;
+        summary.non_acgt_bases += non_acgt;
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

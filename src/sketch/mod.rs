@@ -1,9 +1,13 @@
 //! Sketch algorithms and the self-describing `.aiips` text format.
 //!
 //! Line 1 is `aiips-sketch v1 algorithm=NAME key=value...`, so every file
-//! records its sketch type and parameters. The remaining lines belong to the
-//! algorithm. Parsing is strict: malformed files are rejected, never guessed.
+//! records its sketch type and parameters. The rest belongs to the algorithm:
+//! text lines for MinHash and FracMinHash; a summary line and a binary body
+//! (see [`binary`]) for AIIPS. Parsing is strict: malformed files are
+//! rejected, never guessed.
 
+pub mod aiips;
+pub(crate) mod binary;
 pub mod fracminhash;
 pub mod minhash;
 
@@ -14,13 +18,14 @@ use crate::fastx::Summary;
 pub const MAGIC: &str = "aiips-sketch";
 pub const VERSION: &str = "v1";
 
-/// Every algorithm name the CLI and the format recognize. `MinHash` and
-/// `FracMinHash` are implemented; the others are reserved so files and errors
-/// stay unambiguous.
+/// Every algorithm name the CLI and the format recognize. `MinHash`,
+/// `FracMinHash` and `Aiips` are implemented; the others are reserved so files
+/// and errors stay unambiguous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     MinHash,
     FracMinHash,
+    Aiips,
     BottomK,
     Minimizer,
     OpenSyncmer,
@@ -29,9 +34,10 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
-    pub const ALL: [Algorithm; 7] = [
+    pub const ALL: [Algorithm; 8] = [
         Algorithm::MinHash,
         Algorithm::FracMinHash,
+        Algorithm::Aiips,
         Algorithm::BottomK,
         Algorithm::Minimizer,
         Algorithm::OpenSyncmer,
@@ -43,6 +49,7 @@ impl Algorithm {
         match self {
             Algorithm::MinHash => "minhash",
             Algorithm::FracMinHash => "fracminhash",
+            Algorithm::Aiips => "aiips",
             Algorithm::BottomK => "bottomk",
             Algorithm::Minimizer => "minimizer",
             Algorithm::OpenSyncmer => "open-syncmer",
@@ -56,7 +63,10 @@ impl Algorithm {
     }
 
     pub fn is_implemented(self) -> bool {
-        matches!(self, Algorithm::MinHash | Algorithm::FracMinHash)
+        matches!(
+            self,
+            Algorithm::MinHash | Algorithm::FracMinHash | Algorithm::Aiips
+        )
     }
 
     /// Comma-separated names of the implemented algorithms.
@@ -80,6 +90,8 @@ impl Algorithm {
 pub enum Sketch {
     MinHash(minhash::MinHashSketch),
     FracMinHash(fracminhash::FracMinHashSketch),
+    /// Boxed: positional data makes it much larger than the other variants.
+    Aiips(Box<aiips::AiipsSketch>),
     Unsupported(Algorithm),
 }
 
@@ -88,6 +100,7 @@ impl Sketch {
         match self {
             Sketch::MinHash(_) => Algorithm::MinHash,
             Sketch::FracMinHash(_) => Algorithm::FracMinHash,
+            Sketch::Aiips(_) => Algorithm::Aiips,
             Sketch::Unsupported(algorithm) => *algorithm,
         }
     }
@@ -97,15 +110,17 @@ impl Sketch {
         match self {
             Sketch::MinHash(s) => Some(&s.summary),
             Sketch::FracMinHash(s) => Some(&s.summary),
+            Sketch::Aiips(s) => Some(&s.summary),
             Sketch::Unsupported(_) => None,
         }
     }
 
-    /// k-mer length; `None` for unsupported sketches.
+    /// k-mer length (the probe k for AIIPS); `None` for unsupported sketches.
     pub fn k(&self) -> Option<NonZeroUsize> {
         match self {
             Sketch::MinHash(s) => Some(s.params.k),
             Sketch::FracMinHash(s) => Some(s.params.k),
+            Sketch::Aiips(s) => Some(s.params.probe_k),
             Sketch::Unsupported(_) => None,
         }
     }
@@ -128,8 +143,9 @@ pub const HEADER_BYTES: u64 = 4096;
 
 /// Largest file accepted for a sketch whose file starts with `prefix`, so
 /// files are bounded before being read. FracMinHash files are bounded by the
-/// `size` their header declares (each value at most 20 digits plus newline);
-/// every other file by the largest MinHash sketch. Parsing still validates.
+/// `size` their header declares (each value at most 20 digits plus newline),
+/// AIIPS files by their declared `body_bytes`, and every other file by the
+/// largest MinHash sketch. Parsing still validates.
 pub fn max_file_bytes(prefix: &[u8]) -> u64 {
     let minhash = 21 * minhash::MAX_NUM_HASHES as u64 + HEADER_BYTES;
     let header = prefix.split(|&b| b == b'\n').next().unwrap_or_default();
@@ -141,18 +157,23 @@ pub fn max_file_bytes(prefix: &[u8]) -> u64 {
         return minhash;
     }
     let fields: Vec<&str> = fields.collect();
-    if !fields.contains(&"algorithm=fracminhash") {
-        return minhash;
-    }
-    match fields
+    // The value of `key`, only when it is given exactly once and is valid.
+    let declared = |key: &str| match fields
         .iter()
-        .filter_map(|f| f.strip_prefix("size="))
+        .filter_map(|f| f.strip_prefix(key))
         .collect::<Vec<_>>()[..]
     {
-        [size] => parse_u64(size).map_or(minhash, |size| {
+        [value] => parse_u64(value),
+        _ => None,
+    };
+    if fields.contains(&"algorithm=fracminhash") {
+        declared("size=").map_or(minhash, |size| {
             size.saturating_mul(21).saturating_add(HEADER_BYTES)
-        }),
-        _ => minhash,
+        })
+    } else if fields.contains(&"algorithm=aiips") {
+        declared("body_bytes=").map_or(minhash, |bytes| bytes.saturating_add(HEADER_BYTES))
+    } else {
+        minhash
     }
 }
 
@@ -190,6 +211,13 @@ pub fn parse(bytes: &[u8]) -> Result<Sketch, ParseError> {
     if !bytes.starts_with(MAGIC.as_bytes()) {
         return Err(ParseError::NotSketch);
     }
+    let first_line = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
+    if first_line
+        .split(|&b| b == b' ')
+        .any(|field| field == b"algorithm=aiips")
+    {
+        return parse_binary(bytes);
+    }
     let text = std::str::from_utf8(bytes).map_err(|_| invalid("not valid UTF-8"))?;
     if text.contains('\r') {
         return Err(invalid("carriage return found; lines must end with \\n"));
@@ -198,7 +226,23 @@ pub fn parse(bytes: &[u8]) -> Result<Sketch, ParseError> {
         .strip_suffix('\n')
         .ok_or_else(|| invalid("missing final newline"))?;
     let mut lines = body.split('\n');
-    let mut header = lines.next().unwrap_or_default().split(' ');
+    let (algorithm, params) = parse_header(lines.next().unwrap_or_default())?;
+    match algorithm {
+        Algorithm::MinHash => {
+            minhash::MinHashSketch::parse_body(params, lines).map(Sketch::MinHash)
+        }
+        Algorithm::FracMinHash => {
+            fracminhash::FracMinHashSketch::parse_body(params, lines).map(Sketch::FracMinHash)
+        }
+        Algorithm::Aiips => Err(invalid("aiips sketches have a binary body")),
+        other => Ok(Sketch::Unsupported(other)),
+    }
+}
+
+/// Magic, version and the remaining `key=value` fields of a header line,
+/// with the algorithm already taken.
+fn parse_header(line: &str) -> Result<(Algorithm, Fields<'_>), ParseError> {
+    let mut header = line.split(' ');
     if header.next() != Some(MAGIC) {
         return Err(invalid(format!("first field must be exactly {MAGIC}")));
     }
@@ -211,14 +255,30 @@ pub fn parse(bytes: &[u8]) -> Result<Sketch, ParseError> {
     let name = params.take("algorithm")?;
     let algorithm = Algorithm::from_name(name)
         .ok_or_else(|| invalid(format!("unknown sketch algorithm: {name}")))?;
-    match algorithm {
-        Algorithm::MinHash => {
-            minhash::MinHashSketch::parse_body(params, lines).map(Sketch::MinHash)
+    Ok((algorithm, params))
+}
+
+/// A file whose header line declares a binary-bodied algorithm: only the
+/// header line is checked as text here; the algorithm parses the rest.
+fn parse_binary(bytes: &[u8]) -> Result<Sketch, ParseError> {
+    let newline = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .ok_or_else(|| invalid("header line must end with \\n"))?;
+    let line =
+        std::str::from_utf8(&bytes[..newline]).map_err(|_| invalid("header is not valid UTF-8"))?;
+    if line.contains('\r') {
+        return Err(invalid("carriage return found; lines must end with \\n"));
+    }
+    let rest = &bytes[newline + 1..];
+    match parse_header(line)? {
+        (Algorithm::Aiips, params) => {
+            aiips::AiipsSketch::parse_body(params, rest).map(|s| Sketch::Aiips(Box::new(s)))
         }
-        Algorithm::FracMinHash => {
-            fracminhash::FracMinHashSketch::parse_body(params, lines).map(Sketch::FracMinHash)
-        }
-        other => Ok(Sketch::Unsupported(other)),
+        (other, _) => Err(invalid(format!(
+            "algorithm={} does not have a binary body",
+            other.name()
+        ))),
     }
 }
 
@@ -309,15 +369,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn algorithm_names_round_trip_and_minhash_and_fracminhash_are_implemented() {
+    fn algorithm_names_round_trip_and_minhash_fracminhash_and_aiips_are_implemented() {
         for algorithm in Algorithm::ALL {
             assert_eq!(Algorithm::from_name(algorithm.name()), Some(algorithm));
             assert_eq!(
                 algorithm.is_implemented(),
-                matches!(algorithm, Algorithm::MinHash | Algorithm::FracMinHash)
+                matches!(
+                    algorithm,
+                    Algorithm::MinHash | Algorithm::FracMinHash | Algorithm::Aiips
+                )
             );
         }
-        assert_eq!(Algorithm::implemented_names(), "minhash, fracminhash");
+        assert_eq!(
+            Algorithm::implemented_names(),
+            "minhash, fracminhash, aiips"
+        );
         assert_eq!(Algorithm::from_name("MinHash"), None);
         assert_eq!(Algorithm::from_name(""), None);
     }
@@ -372,6 +438,60 @@ mod tests {
             b"aiips-sketch v1 algorithm=fracminhash size=1\xff\n",
         ] {
             assert_eq!(max_file_bytes(prefix), minhash, "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn file_size_bound_follows_the_declared_aiips_body_bytes() {
+        let minhash = 21 * minhash::MAX_NUM_HASHES as u64 + HEADER_BYTES;
+        // Binary bytes after the header line do not affect the bound.
+        let aiips = |rest: &str| {
+            let mut file = format!("{MAGIC} {VERSION} algorithm=aiips {rest}\n").into_bytes();
+            file.extend_from_slice(&[0x00, 0xff, b'\n']);
+            max_file_bytes(&file)
+        };
+        assert_eq!(aiips("probe_k=15 body_bytes=10"), 10 + HEADER_BYTES);
+        assert_eq!(aiips("body_bytes=0"), HEADER_BYTES);
+        assert_eq!(aiips(&format!("body_bytes={}", u64::MAX)), u64::MAX);
+        for rest in [
+            "probe_k=15",
+            "body_bytes=x",
+            "body_bytes=1 body_bytes=2",
+            "size=10",
+        ] {
+            assert_eq!(aiips(rest), minhash, "{rest}");
+        }
+    }
+
+    #[test]
+    fn binary_bodies_dispatch_on_the_header_line_only() {
+        // A text header without algorithm=aiips keeps the whole-file text checks.
+        assert!(parse(b"aiips-sketch v1 algorithm=bottomk\n\xff\n")
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8"));
+        // An aiips header is parsed even though binary bytes follow it.
+        for (file, message) in [
+            (
+                "aiips-sketch v1 algorithm=aiips",
+                "header line must end with",
+            ),
+            ("aiips-sketch v1 algorithm=aiips\r\n", "carriage return"),
+            (
+                "aiips-sketch v1 algorithm=aiips\n\u{0}",
+                "missing header field: anchor_k",
+            ),
+            (
+                "aiips-sketch v2 algorithm=aiips\n",
+                "unsupported format version",
+            ),
+            (
+                "aiips-sketch v1 algorithm=aiips algorithm=aiips\n",
+                "duplicate header field",
+            ),
+        ] {
+            let error = parse(file.as_bytes()).unwrap_err().to_string();
+            assert!(error.contains(message), "{file:?}: {error}");
         }
     }
 

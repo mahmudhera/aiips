@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aiips::fastx::Summary;
+use aiips::sketch::aiips::{self as aiips_sketch, AiipsComparison, AiipsSketch, LocalConfig};
 use aiips::sketch::fracminhash::{self, FracMinHashSketch};
 use aiips::sketch::minhash::{self, MinHashSketch};
 use aiips::sketch::{self as sketch_format, Estimates, Sketch};
 
 use crate::{
-    cli::{is_sketch, AlgorithmOptions, Command, SketchParams},
+    cli::{is_sketch, AlgorithmOptions, Command, LocalOptions, SketchParams},
     report,
 };
 
@@ -77,7 +78,7 @@ fn classify(path: &Path) -> Result<CompareInput, String> {
 
 fn unsupported_pair(paths: &[PathBuf; 2], kinds: [&str; 2]) -> String {
     format!(
-        "comparison requires two sketches of one algorithm, minhash or fracminhash ({}: {}, {}: {})",
+        "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips ({}: {}, {}: {})",
         paths[0].display(),
         kinds[0],
         paths[1].display(),
@@ -91,6 +92,7 @@ fn unsupported_pair(paths: &[PathBuf; 2], kinds: [&str; 2]) -> String {
 fn compare_sketches(
     paths: &[PathBuf; 2],
     options: &AlgorithmOptions,
+    local: &LocalOptions,
 ) -> Result<[Sketch; 2], String> {
     let inputs = [classify(&paths[0])?, classify(&paths[1])?];
     let kind = |input: &CompareInput| match input {
@@ -113,6 +115,7 @@ fn compare_sketches(
         Some((path, template)) => options.matching(&template, path)?,
         None => options.params()?,
     };
+    local.check_applicable(params.algorithm())?;
     let mut sketches = Vec::with_capacity(2);
     for (path, input) in paths.iter().zip(inputs) {
         sketches.push(match input {
@@ -134,6 +137,7 @@ fn sketch_file(path: &Path, file: File, params: SketchParams) -> Result<Sketch, 
     let sketch = match params {
         SketchParams::MinHash(p) => MinHashSketch::build(file, p).map(Sketch::MinHash),
         SketchParams::FracMinHash(p) => FracMinHashSketch::build(file, p).map(Sketch::FracMinHash),
+        SketchParams::Aiips(p) => AiipsSketch::build(file, p).map(|s| Sketch::Aiips(Box::new(s))),
     }
     .map_err(|e| error(path, e))?;
     if sketch.summary().is_some_and(|summary| summary.kmers == 0) {
@@ -145,9 +149,20 @@ fn sketch_file(path: &Path, file: File, params: SketchParams) -> Result<Sketch, 
     Ok(sketch)
 }
 
+/// Point estimates for one pair: global-set estimates (MinHash, FracMinHash)
+/// or AIIPS global and positional estimates with their diagnostics.
+enum Comparison {
+    Global(Estimates),
+    Aiips(Box<AiipsComparison>),
+}
+
 /// Estimates for two sketches of one algorithm with identical parameters;
 /// halts otherwise, naming each input's type or every differing field.
-fn estimate_pair(paths: &[PathBuf; 2], sketches: &[Sketch; 2]) -> Result<Estimates, String> {
+fn estimate_pair(
+    paths: &[PathBuf; 2],
+    sketches: &[Sketch; 2],
+    config: &LocalConfig,
+) -> Result<Comparison, String> {
     let differ = |differences: Vec<String>| {
         format!(
             "{} and {}: sketch parameters differ: {}; re-sketch with identical parameters",
@@ -162,7 +177,7 @@ fn estimate_pair(paths: &[PathBuf; 2], sketches: &[Sketch; 2]) -> Result<Estimat
             if !differences.is_empty() {
                 return Err(differ(differences));
             }
-            minhash::estimate(a, b)
+            minhash::estimate(a, b).map(Comparison::Global)
         }
         [Sketch::FracMinHash(a), Sketch::FracMinHash(b)] => {
             let differences = a.params.mismatches(&b.params);
@@ -176,7 +191,21 @@ fn estimate_pair(paths: &[PathBuf; 2], sketches: &[Sketch; 2]) -> Result<Estimat
             {
                 return Err(error(path, fracminhash::EMPTY));
             }
-            fracminhash::estimate(a, b)
+            fracminhash::estimate(a, b).map(Comparison::Global)
+        }
+        [Sketch::Aiips(a), Sketch::Aiips(b)] => {
+            let differences = a.params.mismatches(&b.params);
+            if !differences.is_empty() {
+                return Err(differ(differences));
+            }
+            if let Some(path) = paths
+                .iter()
+                .zip([a, b])
+                .find_map(|(path, s)| s.global_probes().is_empty().then_some(path))
+            {
+                return Err(error(path, aiips_sketch::EMPTY));
+            }
+            aiips_sketch::compare(a, b, config).map(|c| Comparison::Aiips(Box::new(c)))
         }
         [a, b] => Err(unsupported_pair(
             paths,
@@ -494,12 +523,16 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
             let bytes = match &sketch {
                 Sketch::MinHash(s) => s.to_bytes(),
                 Sketch::FracMinHash(s) => s.to_bytes(),
+                Sketch::Aiips(s) => s.to_bytes(),
                 Sketch::Unsupported(_) => unreachable!("only implemented sketches are built"),
             };
             let mut transaction =
                 OutputTransaction::install(&input, &metadata, &destination, force, &bytes)?;
             let report = (|| -> io::Result<()> {
                 report::statistics(output, &[summary_row(&input, &sketch)])?;
+                if let Sketch::Aiips(s) = &sketch {
+                    report::aiips_build(output, &input, s, bytes.len() as u64)?;
+                }
                 writeln!(output, "output\t{}", report::label(&destination))?;
                 output.flush()
             })();
@@ -523,11 +556,38 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
                     );
                 }
             }
+            if let Sketch::Aiips(s) = &sketch {
+                if s.global_probes().is_empty() {
+                    eprintln!(
+                        "aiips: warning: {}",
+                        error(
+                            &destination,
+                            format!(
+                                "no probe k-mer hash is at or below the probe_scaled={} threshold; the sketch is empty and cannot be compared",
+                                s.params.probe_scaled
+                            )
+                        )
+                    );
+                }
+            }
             Ok(())
         }
-        Command::Compare { inputs, options } => {
-            let sketches = compare_sketches(&inputs, &options)?;
-            let estimates = estimate_pair(&inputs, &sketches)?;
+        Command::Compare {
+            inputs,
+            options,
+            local,
+        } => {
+            let sketches = compare_sketches(&inputs, &options, &local)?;
+            let comparison = estimate_pair(&inputs, &sketches, &local.config())?;
+            if let Comparison::Aiips(c) = &comparison {
+                for (direction, proxy) in [("a", c.af_containment_a), ("b", c.af_containment_b)] {
+                    if let Some(value) = proxy.filter(|&v| v > 1.0) {
+                        eprintln!(
+                            "aiips: warning: af_containment_{direction} is {value:.6}, above 1: the homologous k-mer fraction model does not fit these inputs (repeats or incompleteness); it is a diagnostic, not AF"
+                        );
+                    }
+                }
+            }
             report::statistics(
                 output,
                 &[
@@ -536,9 +596,14 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
                 ],
             )
             .map_err(|e| format!("stdout: {e}"))?;
-            report::comparison(output, &inputs, &estimates)
-                .and_then(|()| output.flush())
-                .map_err(|e| format!("stdout: {e}"))
+            match &comparison {
+                Comparison::Global(estimates) => report::comparison(output, &inputs, estimates),
+                Comparison::Aiips(estimates) => {
+                    report::aiips_comparison(output, &inputs, estimates)
+                }
+            }
+            .and_then(|()| output.flush())
+            .map_err(|e| format!("stdout: {e}"))
         }
     }
 }
@@ -704,6 +769,7 @@ mod tests {
                 Command::Compare {
                     inputs: [input.clone(), input.clone()],
                     options: AlgorithmOptions::default(),
+                    local: LocalOptions::default(),
                 },
                 &mut FailingWriter { flush_only },
             );
@@ -741,6 +807,7 @@ mod tests {
             Command::Compare {
                 inputs: [input.clone(), input],
                 options: AlgorithmOptions::default(),
+                local: LocalOptions::default(),
             },
             &mut LimitedWriter(statistics.len()),
         );
@@ -857,6 +924,7 @@ mod tests {
                 Command::Compare {
                     inputs,
                     options: AlgorithmOptions::default(),
+                    local: LocalOptions::default(),
                 },
                 &mut stdout,
             )
@@ -875,6 +943,7 @@ mod tests {
                 Command::Compare {
                     inputs,
                     options: AlgorithmOptions::default(),
+                    local: LocalOptions::default(),
                 },
                 &mut stdout,
             )
@@ -900,6 +969,7 @@ mod tests {
             Command::Compare {
                 inputs: [a, b],
                 options: AlgorithmOptions::default(),
+                local: LocalOptions::default(),
             },
             &mut stdout,
         )
@@ -974,6 +1044,7 @@ mod tests {
                 Command::Compare {
                     inputs,
                     options: AlgorithmOptions::default(),
+                    local: LocalOptions::default(),
                 },
                 &mut stdout,
             )

@@ -146,6 +146,46 @@ expect_error "sketch refuses --scaled with minhash" "--scaled applies only to fr
     sketch "$fa" -a minhash -k 3 --scaled 10 -o missing
 [ ! -e missing.aiips ] || fail "refused sketch created missing.aiips"
 
+# AIIPS: anchor_k=5, anchor_scaled=2 keeps one anchor; probe_k=3,
+# probe_scaled=1 keeps every 3-mer: 7 occurrences, 3 distinct canonical probes,
+# 2 windows touching N, a 325-byte file.
+aiips_flags=(--anchor-k 5 --anchor-scaled 2 --probe-k 3 --probe-scaled 1)
+aiips_build=$'input\tanchor_occurrences\tdistinct_anchors\tunique_anchors\tprobe_occurrences\tdistinct_probes\tambiguous_kmers\tfile_bytes'
+aiips_diag=$'input_a\tinput_b\tglobal_a\tglobal_b\tglobal_shared\tmax_containment\tputative_ani\tshared_anchors\trepeated_anchors\tbreaks_order\tbreaks_gap\tbreaks_ratio\tcandidate_blocks\toverlapping_blocks\trejected_few_hits\trejected_disorder\taccepted_blocks\tmapping_hits\tscoring_a\tscoring_b\tscoring_shared\texcluded_boundary_overlap\texcluded_repeats\tcovered_bases_a\tcovered_bases_b\taf_containment_a\taf_containment_b\tjaccard_status\tcontainment_status\tani_status\taf_status'
+aiips_header='aiips-sketch v1 algorithm=aiips anchor_k=5 anchor_scaled=2 probe_k=3 probe_scaled=1 seed=42 hash=murmur3-fmix64 canonical=true body_bytes=133'
+aiips_ones=$'1.000000\t1.000000\t1.000000\t-1\t-1\t-1\t1.000000\t1.000000'
+# One shared anchor makes no block: positional ANI and AF are unsupported.
+aiips_counts=$'3\t3\t3\t1.000000\t1.000000\t1\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t-1\t-1\testimated\testimated\tno_supported_mapping\tno_supported_mapping'
+expect_stdout "sketch aiips fasta" \
+    "$stats"$'\n'"$fa"$'\t'"$counts"$'\n\n'"$aiips_build"$'\n'"$fa"$'\t1\t1\t1\t7\t3\t2\t325\noutput\taiips.aiips' \
+    sketch "$fa" -a aiips "${aiips_flags[@]}" -o aiips
+[ "$(head -n 1 aiips.aiips)" = "$aiips_header" ] ||
+    fail "aiips sketch: unexpected header: $(head -n 1 aiips.aiips)"
+[ "$(wc -c <aiips.aiips | tr -d ' ')" -eq 325 ] ||
+    fail "aiips sketch: expected 325 bytes"
+expect_stdout "sketch aiips gzip fastq" \
+    "$stats"$'\n'"$fq"$'\t'"$counts"$'\n\n'"$aiips_build"$'\n'"$fq"$'\t1\t1\t1\t7\t3\t2\t325\noutput\taiipsreads.aiips' \
+    sketch "$fq" -a aiips "${aiips_flags[@]}" -o aiipsreads
+cmp -s aiips.aiips aiipsreads.aiips || fail "fasta and gzip fastq aiips sketches differ"
+expect_stdout "compare identical aiips sketches" \
+    "$stats"$'\naiips.aiips\t'"$counts"$'\naiipsreads.aiips\t'"$counts"$'\n\n'"$metrics"$'\naiips.aiips\taiipsreads.aiips\t'"$aiips_ones"$'\n\n'"$aiips_diag"$'\naiips.aiips\taiipsreads.aiips\t'"$aiips_counts" \
+    compare aiips.aiips aiipsreads.aiips
+expect_stdout "compare aiips sketch vs fasta" \
+    "$stats"$'\naiips.aiips\t'"$counts"$'\n'"$fa"$'\t'"$counts"$'\n\n'"$metrics"$'\naiips.aiips\t'"$fa"$'\t'"$aiips_ones"$'\n\n'"$aiips_diag"$'\naiips.aiips\t'"$fa"$'\t'"$aiips_counts" \
+    compare aiips.aiips "$fa"
+expect_error "compare refuses aiips vs fracminhash" "(aiips.aiips: aiips, frac.aiips: fracminhash)" \
+    compare aiips.aiips frac.aiips
+expect_error "sketch refuses -k with aiips" "-k/--kmer-size does not apply to aiips" \
+    sketch "$fa" -a aiips -k 3 -o missing
+expect_error "sketch refuses even --probe-k" "odd integer from 1 to 31" \
+    sketch "$fa" -a aiips --probe-k 4 -o missing
+expect_error "sketch refuses even --anchor-k" "anchor k-mer length must be an odd integer" \
+    sketch "$fa" -a aiips --probe-k 3 --anchor-k 4 -o missing
+expect_error "compare refuses an option differing from the sketch" \
+    "--anchor-scaled 125 does not match anchor_scaled=2 recorded in aiips.aiips" \
+    compare aiips.aiips "$fa" --anchor-scaled 125
+[ ! -e missing.aiips ] || fail "refused sketch created missing.aiips"
+
 before=$(cat sample.aiips)
 expect_error "sketch refuses existing output" "use -f or --force" \
     sketch "$fa" -a minhash -k 3 -o sample
