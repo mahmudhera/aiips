@@ -539,3 +539,53 @@ fn af_containment_cross_check_is_near_one_for_full_homologs() {
     assert!((c.af_containment_a.unwrap() - 0.5).abs() < 0.02);
     assert!((c.af_containment_b.unwrap() - 1.0).abs() < 0.02);
 }
+
+#[test]
+fn heterogeneous_identity_uses_local_survival_without_uniform_regression() {
+    for seed in [71, 72, 73] {
+        let genome = random_bases(seed, 2_000_000);
+        for rates in [[0.02, 0.15], [0.05, 0.05]] {
+            let mut b = Vec::new();
+            let mut substitutions = 0;
+            for (i, region) in genome.chunks(50_000).enumerate() {
+                let (mutated, n) = mutate(region, rates[i % 2], seed + 100 + i as u64);
+                b.extend(mutated);
+                substitutions += n;
+            }
+            let c = positional(&[&genome], &[&b], &defaults());
+            let truth = 1.0 - substitutions as f64 / genome.len() as f64;
+            let tolerance = if rates[0] == rates[1] { 0.003 } else { 0.015 };
+            assert!(
+                (c.local.ani.unwrap() - truth).abs() < tolerance,
+                "seed {seed}, rates {rates:?}: {:?} vs {truth}",
+                c.local.ani
+            );
+        }
+    }
+}
+
+#[test]
+fn fragmented_mutated_genomes_recover_af_without_filling_novel_tails() {
+    let a = random_bases(81, 2_000_000);
+    let (b, _) = mutate(&a, 0.05, 82);
+    for novel in [0, 1000] {
+        let mut contigs = b.chunks(5000).map(|c| c.to_vec()).collect::<Vec<_>>();
+        if novel > 0 {
+            for (i, c) in contigs.iter_mut().enumerate() {
+                c[5000 - novel..].copy_from_slice(&random_bases(1000 + i as u64, novel));
+            }
+        }
+        let refs = contigs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let c = positional(&[&a], &refs, &defaults());
+        let truth = 1.0 - novel as f64 / 5000.0;
+        assert!(
+            (c.local.af_a.unwrap() - truth).abs() < 0.035,
+            "{novel}: {c:?}"
+        );
+        assert!(
+            (c.local.af_b.unwrap() - truth).abs() < 0.035,
+            "{novel}: {c:?}"
+        );
+        assert!(c.local.q.is_some());
+    }
+}

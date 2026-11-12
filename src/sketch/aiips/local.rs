@@ -29,7 +29,9 @@
 //! gave +0.0001, +0.0002 and −0.0009. Interior probes are counted whether or
 //! not they overlap anchors, so enrichment and depletion cancel. With x shared eligible hashes and n_A, n_B
 //! eligible hashes per side, counts are pooled over blocks:
-//! q = 2 X / (N_A + N_B) and ANI = q^(1/k2). Under the simple substitution
+//! q = 2 X / (N_A + N_B). Mapping-only local contrasts split heterogeneous
+//! regions; ANI averages regional roots by span. Uniform comparisons retain
+//! the pooled root, avoiding noise bias from small windows. Under the substitution
 //! model a homologous k2-mer is unchanged with probability ANI^k2, so this is
 //! a model-based estimate, not an alignment identity.
 //!
@@ -40,7 +42,9 @@
 //! last anchor + k1)) on each genome, divided by that genome's total length,
 //! ambiguous bases included. It is a positional coverage proxy: terminal
 //! regions outside the outermost anchors are not counted, and a block holding
-//! an unshared segment counts it.
+//! an unshared segment counts it. For structurally simple, approximately
+//! uniform fragmented inputs, a guarded C/q correction can increase AF.
+//! The raw covered-base counters always retain observed span coverage.
 
 use std::ops::Range;
 
@@ -163,11 +167,11 @@ pub struct LocalCounts {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalEstimates {
-    /// q^(1/k2), or `None` when unsupported.
+    /// Regional mean identity (pooled root for uniform inputs), or `None`.
     pub ani: Option<f64>,
-    /// 2 X / (N_A + N_B), the estimated k2-mer survival rate ANI^k2.
+    /// 2 X / (N_A + N_B), k2-mer survival; differs from mean ANI^k2 in mixtures.
     pub q: Option<f64>,
-    /// Covered fraction of A and of B.
+    /// Estimated AF, including guarded fragmentation correction when applicable.
     pub af_a: Option<f64>,
     pub af_b: Option<f64>,
     pub ani_status: LocalStatus,
@@ -360,6 +364,94 @@ fn survival(counts: &LocalCounts, config: &LocalConfig) -> Option<f64> {
         .then(|| 2.0 * counts.scoring_shared as f64 / pooled as f64)
 }
 
+#[derive(Clone, Copy, Default)]
+struct Region {
+    mapping_shared: f64,
+    mapping_union: f64,
+    shared: u64,
+    pooled: u64,
+    span: u64,
+}
+
+impl Region {
+    fn add(self, b: Self) -> Self {
+        Self {
+            mapping_shared: self.mapping_shared + b.mapping_shared,
+            mapping_union: self.mapping_union + b.mapping_union,
+            shared: self.shared + b.shared,
+            pooled: self.pooled + b.pooled,
+            span: self.span + b.span,
+        }
+    }
+    fn likelihood(self) -> f64 {
+        let x = self.mapping_shared;
+        let n = self.mapping_union;
+        if x == 0.0 || x == n {
+            return 0.0;
+        }
+        x * (x / n).ln() + (n - x) * ((n - x) / n).ln()
+    }
+}
+
+/// Binary segmentation using only mapping counts. Conditional on the union
+/// count, independent sampled shared/unshared hashes give a binomial working
+/// likelihood. Overlapping k-mers violate independence: the conservative
+/// 2*ln(N) penalty is a heuristic, not a significance level. Scoring counts
+/// never choose a split. Prefix sums bound work and recursion to O(B log B)
+/// for balanced splits, with a hard depth limit for adversarial input.
+fn regional_ani(regions: &[Region], k: u32) -> (f64, bool) {
+    fn split(prefix: &[Region], lo: usize, hi: usize, depth: usize, k: u32) -> (f64, bool) {
+        let difference = |a: Region, b: Region| Region {
+            mapping_shared: a.mapping_shared - b.mapping_shared,
+            mapping_union: a.mapping_union - b.mapping_union,
+            shared: a.shared - b.shared,
+            pooled: a.pooled - b.pooled,
+            span: a.span - b.span,
+        };
+        let total = difference(prefix[hi], prefix[lo]);
+        let mut best = (0.0, lo);
+        if depth < 16 {
+            for mid in lo + 1..hi {
+                // Local contrast also detects alternating regions whose
+                // global left/right averages are almost identical.
+                let left = difference(prefix[mid], prefix[mid.saturating_sub(4).max(lo)]);
+                let right = difference(prefix[(mid + 4).min(hi)], prefix[mid]);
+                if left.mapping_union < 40.0 || right.mapping_union < 40.0 {
+                    continue;
+                }
+                let gain = left.likelihood() + right.likelihood()
+                    - left.add(right).likelihood()
+                    - 2.0 * (left.mapping_union + right.mapping_union).max(2.0).ln();
+                if gain > best.0 {
+                    best = (gain, mid);
+                }
+            }
+        }
+        if best.1 != lo {
+            let a = split(prefix, lo, best.1, depth + 1, k);
+            let b = split(prefix, best.1, hi, depth + 1, k);
+            (a.0 + b.0, true)
+        } else {
+            // A segment with no scoring evidence uses the pooled parent
+            // estimate at the caller, rather than selecting positive windows.
+            if total.shared == 0 || total.pooled < DEFAULT_MIN_SCORING_PROBES {
+                return (f64::NAN, false);
+            }
+            let q = 2.0 * total.shared as f64 / total.pooled as f64;
+            (total.span as f64 * q.powf(1.0 / f64::from(k)), false)
+        }
+    }
+    let mut prefix = vec![Region::default()];
+    for &r in regions {
+        prefix.push(prefix.last().unwrap().add(r));
+    }
+    let (sum, heterogeneous) = split(&prefix, 0, regions.len(), 0, k);
+    (
+        sum / prefix.last().unwrap().span.max(1) as f64,
+        heterogeneous,
+    )
+}
+
 pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analysis {
     let k1 = a.params.anchor_k.get() as u32;
     let k2 = a.params.probe_k.get() as u32;
@@ -373,6 +465,7 @@ pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analys
     // Buffers reused across blocks: [A, B] mapping and scoring entries, hits.
     let (mut mapping, mut scoring): ([Entries; 2], [Entries; 2]) = Default::default();
     let mut hits = Vec::new();
+    let mut regions = Vec::new();
     for (index, block) in candidates.blocks.iter().enumerate() {
         let matches = candidates.block_matches(block);
         let (first, last) = (matches[0], matches[matches.len() - 1]);
@@ -419,6 +512,13 @@ pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analys
         counts.scoring_shared += shared;
         counts.scoring_a += n_a;
         counts.scoring_b += n_b;
+        regions.push(Region {
+            mapping_shared: hit_count as f64,
+            mapping_union: (mapping_a.len() + mapping_b.len()) as f64 - hit_count as f64,
+            shared,
+            pooled: n_a + n_b,
+            span: u64::from(last.x - first.x),
+        });
         covered_a.push(candidates.interval_a(block, k1));
         covered_b.push(candidates.interval_b(block, k1));
     }
@@ -437,11 +537,36 @@ pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analys
         }
     } else {
         let q = survival(&counts, config);
+        let (regional, heterogeneous) = regional_ani(&regions, k2);
+        let mut af_a = counts.covered_bases_a as f64 / a.summary.bases as f64;
+        let mut af_b = counts.covered_bases_b as f64 / b.summary.bases as f64;
+        // Correct fragmentation loss only when mapping supports a uniform,
+        // structurally simple comparison. Preserve raw span numerators as
+        // diagnostics. C/q remains a k-mer model, not a base alignment.
+        let m = counts.matching;
+        if (a.contigs().len() > 1 || b.contigs().len() > 1)
+            && !heterogeneous
+            && m.breaks_order * 1000 <= m.shared_anchors
+            && m.breaks_gap + m.breaks_ratio == 0
+            && m.repeated_anchors * 50 < m.shared_anchors
+            && counts.excluded_repeats * 50 < counts.scoring_a + counts.scoring_b
+        {
+            if let (Some(q), Ok(global)) = (q, super::estimate(a, b)) {
+                af_a = (global.containment_a_in_b / q).clamp(af_a, 1.0);
+                af_b = (global.containment_b_in_a / q).clamp(af_b, 1.0);
+            }
+        }
         LocalEstimates {
-            ani: q.map(|q| q.powf(1.0 / f64::from(k2))),
+            ani: q.map(|q| {
+                if heterogeneous && regional.is_finite() {
+                    regional
+                } else {
+                    q.powf(1.0 / f64::from(k2))
+                }
+            }),
             q,
-            af_a: Some(counts.covered_bases_a as f64 / a.summary.bases as f64),
-            af_b: Some(counts.covered_bases_b as f64 / b.summary.bases as f64),
+            af_a: Some(af_a),
+            af_b: Some(af_b),
             ani_status: if q.is_some() {
                 LocalStatus::Estimated
             } else {
@@ -464,6 +589,30 @@ mod tests {
     use crate::sketch::aiips::blocks::tests::{anchor_kmer, config, dense};
     use crate::sketch::aiips::tests::{build, fasta, params, random_bases, reverse_complement};
     use std::collections::HashMap;
+
+    #[test]
+    fn regional_estimator_preserves_uniform_pool_and_separates_alternating_identity() {
+        let make = |p: f64| {
+            let q = p.powi(15);
+            Region {
+                mapping_shared: 1000.0 * q,
+                mapping_union: 1000.0 * (2.0 - q),
+                shared: (10000.0 * q).round() as u64,
+                pooled: 20000,
+                span: 10000,
+            }
+        };
+        let uniform = vec![make(0.95); 40];
+        let (ani, changed) = regional_ani(&uniform, 15);
+        assert!(!changed);
+        assert!((ani - 0.95).abs() < 0.0001);
+        let mosaic = (0..40)
+            .map(|i| make(if i / 5 % 2 == 0 { 0.98 } else { 0.85 }))
+            .collect::<Vec<_>>();
+        let (ani, changed) = regional_ani(&mosaic, 15);
+        assert!(changed);
+        assert!((ani - 0.915).abs() < 0.0001, "{ani}");
+    }
 
     fn substitute(sequence: &[u8], every: usize) -> Vec<u8> {
         let mut out = sequence.to_vec();

@@ -474,7 +474,16 @@ flag (default in brackets):
    provisional heuristic, not a calibrated test.
 5. *ANI.* The scoring-role probes of accepted blocks are pooled; any hash
    occurring more than once in either block is excluded from both. Then
-   `q = 2X / (N_A + N_B)` and `ani = q^(1/k2)`. Under the simple substitution
+   `q = 2X / (N_A + N_B)` is retained as the survival diagnostic. Mapping-only
+   contrasts between up to four neighboring blocks on each side identify
+   heterogeneous regions using a binomial working likelihood with a `2 ln N`
+   penalty and at least 40 mapping-union hashes per side. These are heuristics,
+   not calibrated significance thresholds: overlapping k-mers are dependent.
+   Scoring counts are pooled within inferred regions, then regional roots are
+   averaged by span. Uniform comparisons retain `ani = q^(1/k2)` to avoid
+   small-window transformation bias. If any inferred region has no shared
+   scoring probe or fewer than 50 eligible probes, ANI falls back to the pooled
+   root. Under the simple substitution
    model a homologous k2-mer is unchanged with probability `ANI^k2`.
    `ani` is `-1` in three cases: no block is accepted; fewer than
    `--min-scoring-probes` [50] probes are eligible; or none is shared. It is
@@ -484,6 +493,14 @@ flag (default in brackets):
    proxy, not a base-level alignment fraction:
    - ends outside the outermost shared anchors are not counted;
    - an unshared segment inside a block is counted.
+
+   For fragmented inputs, reported AF can be increased toward clipped `C/q`
+   when the mapping contrast finds no heterogeneity, there are no gap or ratio
+   breaks, order breaks are at most 0.1% of shared anchors, and repeat counters
+   are below 2% of their corresponding retained counts. The correction never
+   decreases observed span coverage. These guards are provisional and do not
+   prove uniform homology. The `covered_bases_*` diagnostics always retain raw
+   observed coverage, so reported AF may exceed their ratio to genome length.
 
 These defaults favour divergent genomes; they are prototype values, not tuned.
 
@@ -503,12 +520,14 @@ Their rejection reduces AF (0.81-0.89 at 85% in these simulations) and selects
 better-conserved blocks. The positional ANI has not been compared with
 base-level alignments; treat it as uncalibrated.
 
-`af_containment_a` and `af_containment_b` are `C / q` (C over ANI^k2). Under a
+`af_containment_a` and `af_containment_b` are `C / q`. For heterogeneous identity,
+`q` differs from the regional mean ANI raised to k2. Under a
 model where a fraction of the k2-mers is homologous and each survives with
 probability ANI^k2, this estimates that fraction. It is a k-mer homologous
 fraction, not an aligned-base fraction. It is not clipped, and can exceed 1
 through repeats, incompleteness, or sampling noise; a value above 1 also
-prints a warning on stderr. It is never used as AF.
+prints a warning on stderr. Reported AF uses its clipped value only under the
+fragmentation guards above.
 
 A diagnostics table follows the comparison row:
 
@@ -559,6 +578,18 @@ Command-specific help takes precedence over invalid arguments anywhere before
 `--`. After `--`, `-h` and `--help` are literal filenames.
 
 ## Benchmark against skani
+
+The original figures below precede the regional ANI and guarded fragmented-AF
+corrections. A rerun on the same 252 pairs reduces mosaic ANI MAE from 2.19 to
+0.70 pp and draft AF MAE from 8.82 to 1.20 pp. Uniform-substitution ANI MAE
+remains 0.10 pp. Both-sided-island ANI MAE rises from 0.16 to 0.19 pp.
+In a fresh interleaved 84-pair cost run (five repeats, seed 101, both backbones),
+the revised version takes 1.022x skani's time and 0.925x its peak memory;
+the previous binary takes 1.021x and 0.930x respectively in the same run.
+It remains slightly over skani's time budget.
+These evaluation pairs informed development, so this rerun is not an independent
+validation of the new heuristics. Remaining limitations include low-identity
+mapping selection, heuristic segmentation, and the k-mer assumptions behind AF.
 
 These figures come from simulated genome pairs whose true ANI and AF are known
 exactly. They compare AIIPS with skani 0.3.1 on a matched compute budget. They
