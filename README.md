@@ -482,8 +482,8 @@ flag (default in brackets):
    Scoring counts are pooled within inferred regions, then regional roots are
    averaged by span. Uniform comparisons retain `ani = q^(1/k2)` to avoid
    small-window transformation bias. If any inferred region has no shared
-   scoring probe or fewer than 50 eligible probes, ANI falls back to the pooled
-   root. Under the simple substitution
+   scoring probe or fewer than `--min-scoring-probes` [50] eligible probes, ANI
+   falls back to the pooled root. Under the simple substitution
    model a homologous k2-mer is unchanged with probability `ANI^k2`.
    `ani` is `-1` in three cases: no block is accepted; fewer than
    `--min-scoring-probes` [50] probes are eligible; or none is shared. It is
@@ -494,13 +494,22 @@ flag (default in brackets):
    - ends outside the outermost shared anchors are not counted;
    - an unshared segment inside a block is counted.
 
-   For fragmented inputs, reported AF can be increased toward clipped `C/q`
-   when the mapping contrast finds no heterogeneity, there are no gap or ratio
-   breaks, order breaks are at most 0.1% of shared anchors, and repeat counters
-   are below 2% of their corresponding retained counts. The correction never
-   decreases observed span coverage. These guards are provisional and do not
-   prove uniform homology. The `covered_bases_*` diagnostics always retain raw
-   observed coverage, so reported AF may exceed their ratio to genome length.
+   For fragmented inputs (either genome has more than one record), reported AF
+   can be increased toward clipped `C/q` when all of these hold:
+   - the mapping contrast finds no heterogeneity;
+   - in each genome, distinct anchor hashes occurring more than once number
+     under 2% of those occurring once;
+   - scoring probes excluded as repeats are under 2% of eligible ones.
+
+   Run breaks (order, gap, ratio) do not block it: islands and rearrangements
+   break runs, and `C/q` estimates the homologous fraction regardless. The
+   anchor repeat test is per genome because `repeated_anchors / shared_anchors`
+   grows with divergence: a repeated hash is shared if any copy survives, a
+   unique one only if its single copy does. At 100% identity the two ratios are
+   equal. The correction never decreases observed span coverage. These guards
+   are provisional and do not prove uniform homology. The `covered_bases_*`
+   diagnostics always retain raw observed coverage, so reported AF may exceed
+   their ratio to genome length.
 
 These defaults favour divergent genomes; they are prototype values, not tuned.
 
@@ -579,17 +588,20 @@ Command-specific help takes precedence over invalid arguments anywhere before
 
 ## Benchmark against skani
 
-The original figures below precede the regional ANI and guarded fragmented-AF
+The original figures below precede the regional ANI and fragmented-AF
 corrections. A rerun on the same 252 pairs reduces mosaic ANI MAE from 2.19 to
-0.70 pp and draft AF MAE from 8.82 to 1.20 pp. Uniform-substitution ANI MAE
+0.70 pp and draft AF MAE from 8.82 to 0.14 pp. Uniform-substitution ANI MAE
 remains 0.10 pp. Both-sided-island ANI MAE rises from 0.16 to 0.19 pp.
 In a fresh interleaved 84-pair cost run (five repeats, seed 101, both backbones),
-the revised version takes 1.022x skani's time and 0.925x its peak memory;
-the previous binary takes 1.021x and 0.930x respectively in the same run.
-It remains slightly over skani's time budget.
-These evaluation pairs informed development, so this rerun is not an independent
-validation of the new heuristics. Remaining limitations include low-identity
-mapping selection, heuristic segmentation, and the k-mer assumptions behind AF.
+the revised version takes 1.021x skani's time and 0.925x its peak memory;
+the original binary takes 1.019x and 0.899x in the same run (per pair, the
+revised/original time ratio has median 1.001). It remains slightly over skani's
+time budget. These evaluation pairs informed development, so this rerun is not
+an independent validation of the new heuristics. Mosaic ANI is still
+overestimated: regions shorter than about 40 kb are not detected, and
+low-identity blocks are likely rejected more often, so accepted blocks
+over-represent high identity (not measured directly). Other limitations are the heuristic segmentation and the k-mer
+assumptions behind AF.
 
 These figures come from simulated genome pairs whose true ANI and AF are known
 exactly. They compare AIIPS with skani 0.3.1 on a matched compute budget. They

@@ -589,3 +589,98 @@ fn fragmented_mutated_genomes_recover_af_without_filling_novel_tails() {
         assert!(c.local.q.is_some());
     }
 }
+
+/// Contigs of 4.7 kb: island junctions (multiples of 20 kb) fall inside them.
+fn fragments(sequence: &[u8]) -> Vec<&[u8]> {
+    sequence.chunks(4_700).collect()
+}
+
+#[test]
+fn fragmented_drafts_with_islands_or_rearrangements_recover_af() {
+    let a = random_bases(91, 2_000_000);
+    // A-only islands: 30 of the 100 windows of 20 kb are deleted.
+    let kept = a
+        .chunks(20_000)
+        .enumerate()
+        .filter(|(i, _)| ![1, 4, 7].contains(&(i % 10)))
+        .flat_map(|(_, c)| c.to_vec())
+        .collect::<Vec<_>>();
+    let (kept, _) = mutate(&kept, 0.01, 92);
+    // B-only islands: 20 kb of novel sequence after every 140 kb kept.
+    let mut novel = Vec::new();
+    for (i, c) in kept.chunks(140_000).enumerate() {
+        novel.extend_from_slice(c);
+        novel.extend(random_bases(200 + i as u64, 20_000));
+    }
+    // One inversion and one translocation, both 150-200 kb.
+    let (whole, _) = mutate(&a, 0.02, 93);
+    let mut rearranged = whole[..300_000].to_vec();
+    rearranged.extend(reverse_complement(&whole[300_000..500_000]));
+    rearranged.extend_from_slice(&whole[1_000_000..1_150_000]);
+    rearranged.extend_from_slice(&whole[500_000..1_000_000]);
+    rearranged.extend_from_slice(&whole[1_150_000..]);
+    let novel_af_b = kept.len() as f64 / novel.len() as f64;
+    for (name, b, truth) in [
+        ("A-only islands", &kept, (0.7, 1.0)),
+        ("islands in both", &novel, (0.7, novel_af_b)),
+        ("rearranged", &rearranged, (1.0, 1.0)),
+    ] {
+        let c = positional(&[&a], &fragments(b), &defaults());
+        let m = c.local.counts.matching;
+        // Islands and rearrangements break runs; that no longer blocks C/q.
+        assert!(
+            m.breaks_order + m.breaks_gap + m.breaks_ratio > 0,
+            "{name}: {m:?}"
+        );
+        let (af_a, af_b) = af(&c);
+        assert!(
+            (af_a - truth.0).abs() < 0.03 && (af_b - truth.1).abs() < 0.03,
+            "{name}: AF {af_a} {af_b} vs {truth:?}"
+        );
+        // Span coverage alone loses the contig ends.
+        let span_a = c.local.counts.covered_bases_a as f64 / a.len() as f64;
+        assert!(af_a - span_a > 0.03, "{name}: {af_a} vs span {span_a}");
+    }
+}
+
+#[test]
+fn af_repeat_guard_ignores_divergence_and_blocks_repetitive_genomes() {
+    // A 20 kb element in 4 copies: about 1% of A's distinct anchors repeat.
+    let element = random_bases(101, 20_000);
+    let mut a = random_bases(102, 2_000_000);
+    for i in 0..4 {
+        let at = 300_000 + i * 400_000;
+        a[at..at + element.len()].copy_from_slice(&element);
+    }
+    let (b, _) = mutate(&a, 0.10, 103);
+    let c = positional(&[&a], &fragments(&b), &defaults());
+    let m = c.local.counts.matching;
+    // At 10% divergence a repeated hash is shared if any copy survives, so
+    // the shared-anchor ratio passes 2% although each genome's stays near 1%.
+    assert!(m.repeated_anchors * 50 >= m.shared_anchors, "{m:?}");
+    let (af_a, af_b) = af(&c);
+    let span_a = c.local.counts.covered_bases_a as f64 / a.len() as f64;
+    assert!(
+        af_a > 0.93 && af_b > 0.93 && af_a - span_a > 0.2,
+        "AF {af_a} {af_b}, span {span_a}"
+    );
+
+    // A 30 kb element in 10 copies (30% of the genome): no correction.
+    let element = random_bases(104, 30_000);
+    let mut repetitive = random_bases(105, 1_000_000);
+    for i in 0..10 {
+        let at = 20_000 + i * 97_000;
+        repetitive[at..at + element.len()].copy_from_slice(&element);
+    }
+    let (b, _) = mutate(&repetitive, 0.01, 106);
+    let c = positional(&[&repetitive], &fragments(&b), &defaults());
+    let l = &c.local;
+    assert_eq!(
+        l.af_a.unwrap(),
+        l.counts.covered_bases_a as f64 / repetitive.len() as f64
+    );
+    assert_eq!(
+        l.af_b.unwrap(),
+        l.counts.covered_bases_b as f64 / b.len() as f64
+    );
+}

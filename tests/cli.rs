@@ -2912,6 +2912,12 @@ fn af_containment_above_one_is_reported_with_a_warning() {
                 "step {step}: {name}={value}; stderr: {stderr}"
             );
             if value > 1.0 {
+                assert!(
+                    stderr.contains(&format!(
+                        "{name} is {value:.6}, above 1: the homologous k-mer fraction model does not fit these inputs (repeats or incompleteness); AF uses it, clipped to 1, only for fragmented inputs passing the uniformity and repeat guards\n"
+                    )),
+                    "{stderr}"
+                );
                 above += 1;
             } else {
                 not_above += 1;

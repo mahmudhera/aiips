@@ -42,8 +42,8 @@
 //! last anchor + k1)) on each genome, divided by that genome's total length,
 //! ambiguous bases included. It is a positional coverage proxy: terminal
 //! regions outside the outermost anchors are not counted, and a block holding
-//! an unshared segment counts it. For structurally simple, approximately
-//! uniform fragmented inputs, a guarded C/q correction can increase AF.
+//! an unshared segment counts it. For fragmented inputs with no detected
+//! heterogeneity and few repeats, a guarded C/q correction can increase AF.
 //! The raw covered-base counters always retain observed span coverage.
 
 use std::ops::Range;
@@ -399,8 +399,17 @@ impl Region {
 /// 2*ln(N) penalty is a heuristic, not a significance level. Scoring counts
 /// never choose a split. Prefix sums bound work and recursion to O(B log B)
 /// for balanced splits, with a hard depth limit for adversarial input.
-fn regional_ani(regions: &[Region], k: u32) -> (f64, bool) {
-    fn split(prefix: &[Region], lo: usize, hi: usize, depth: usize, k: u32) -> (f64, bool) {
+/// A leaf needs at least `min_pooled` eligible scoring probes
+/// (`--min-scoring-probes`), as the pooled estimate does.
+fn regional_ani(regions: &[Region], k: u32, min_pooled: u64) -> (f64, bool) {
+    fn split(
+        prefix: &[Region],
+        lo: usize,
+        hi: usize,
+        depth: usize,
+        k: u32,
+        min_pooled: u64,
+    ) -> (f64, bool) {
         let difference = |a: Region, b: Region| Region {
             mapping_shared: a.mapping_shared - b.mapping_shared,
             mapping_union: a.mapping_union - b.mapping_union,
@@ -428,13 +437,13 @@ fn regional_ani(regions: &[Region], k: u32) -> (f64, bool) {
             }
         }
         if best.1 != lo {
-            let a = split(prefix, lo, best.1, depth + 1, k);
-            let b = split(prefix, best.1, hi, depth + 1, k);
+            let a = split(prefix, lo, best.1, depth + 1, k, min_pooled);
+            let b = split(prefix, best.1, hi, depth + 1, k, min_pooled);
             (a.0 + b.0, true)
         } else {
             // A segment with no scoring evidence uses the pooled parent
             // estimate at the caller, rather than selecting positive windows.
-            if total.shared == 0 || total.pooled < DEFAULT_MIN_SCORING_PROBES {
+            if total.shared == 0 || total.pooled < min_pooled {
                 return (f64::NAN, false);
             }
             let q = 2.0 * total.shared as f64 / total.pooled as f64;
@@ -445,11 +454,22 @@ fn regional_ani(regions: &[Region], k: u32) -> (f64, bool) {
     for &r in regions {
         prefix.push(prefix.last().unwrap().add(r));
     }
-    let (sum, heterogeneous) = split(&prefix, 0, regions.len(), 0, k);
+    let (sum, heterogeneous) = split(&prefix, 0, regions.len(), 0, k, min_pooled);
     (
         sum / prefix.last().unwrap().span.max(1) as f64,
         heterogeneous,
     )
+}
+
+/// Whether fewer than 2% of a genome's distinct anchor hashes repeat, relative
+/// to those occurring once. This is the shared-anchor ratio
+/// `repeated_anchors / shared_anchors` at 100% identity, measured on one
+/// genome: shared counts depend on divergence (a repeated hash is kept if any
+/// copy survives, a unique one only if its single copy does), this does not.
+fn few_repeats(sketch: &AiipsSketch) -> bool {
+    let anchors = sketch.anchors();
+    let unique = anchors.unique();
+    (anchors.hashes.len() - unique) * 50 < unique
 }
 
 pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analysis {
@@ -537,18 +557,18 @@ pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analys
         }
     } else {
         let q = survival(&counts, config);
-        let (regional, heterogeneous) = regional_ani(&regions, k2);
+        let (regional, heterogeneous) = regional_ani(&regions, k2, config.min_scoring_probes);
         let mut af_a = counts.covered_bases_a as f64 / a.summary.bases as f64;
         let mut af_b = counts.covered_bases_b as f64 / b.summary.bases as f64;
-        // Correct fragmentation loss only when mapping supports a uniform,
-        // structurally simple comparison. Preserve raw span numerators as
+        // Correct fragmentation loss only when mapping finds no identity
+        // heterogeneity and neither genome is repetitive. Islands and
+        // rearrangements break runs but are what C/q measures, so run breaks
+        // do not block the correction. Preserve raw span numerators as
         // diagnostics. C/q remains a k-mer model, not a base alignment.
-        let m = counts.matching;
         if (a.contigs().len() > 1 || b.contigs().len() > 1)
             && !heterogeneous
-            && m.breaks_order * 1000 <= m.shared_anchors
-            && m.breaks_gap + m.breaks_ratio == 0
-            && m.repeated_anchors * 50 < m.shared_anchors
+            && few_repeats(a)
+            && few_repeats(b)
             && counts.excluded_repeats * 50 < counts.scoring_a + counts.scoring_b
         {
             if let (Some(q), Ok(global)) = (q, super::estimate(a, b)) {
@@ -590,28 +610,72 @@ mod tests {
     use crate::sketch::aiips::tests::{build, fasta, params, random_bases, reverse_complement};
     use std::collections::HashMap;
 
+    /// A block's counts at identity `p`, k2 = 15, with expected values.
+    fn region(p: f64) -> Region {
+        let q = p.powi(15);
+        Region {
+            mapping_shared: 1000.0 * q,
+            mapping_union: 1000.0 * (2.0 - q),
+            shared: (10000.0 * q).round() as u64,
+            pooled: 20000,
+            span: 10000,
+        }
+    }
+
+    /// 40 blocks alternating between 98% and 85% identity every 5 blocks.
+    fn alternating() -> Vec<Region> {
+        (0..40)
+            .map(|i| region(if i / 5 % 2 == 0 { 0.98 } else { 0.85 }))
+            .collect()
+    }
+
     #[test]
     fn regional_estimator_preserves_uniform_pool_and_separates_alternating_identity() {
-        let make = |p: f64| {
-            let q = p.powi(15);
-            Region {
-                mapping_shared: 1000.0 * q,
-                mapping_union: 1000.0 * (2.0 - q),
-                shared: (10000.0 * q).round() as u64,
-                pooled: 20000,
-                span: 10000,
-            }
-        };
-        let uniform = vec![make(0.95); 40];
-        let (ani, changed) = regional_ani(&uniform, 15);
+        let uniform = vec![region(0.95); 40];
+        let (ani, changed) = regional_ani(&uniform, 15, DEFAULT_MIN_SCORING_PROBES);
         assert!(!changed);
         assert!((ani - 0.95).abs() < 0.0001);
-        let mosaic = (0..40)
-            .map(|i| make(if i / 5 % 2 == 0 { 0.98 } else { 0.85 }))
-            .collect::<Vec<_>>();
-        let (ani, changed) = regional_ani(&mosaic, 15);
+        let (ani, changed) = regional_ani(&alternating(), 15, DEFAULT_MIN_SCORING_PROBES);
         assert!(changed);
         assert!((ani - 0.915).abs() < 0.0001, "{ani}");
+    }
+
+    #[test]
+    fn regional_leaves_need_the_configured_scoring_probes() {
+        // One unsplit leaf pools 40 * 20000 eligible probes.
+        let uniform = vec![region(0.95); 40];
+        assert!(regional_ani(&uniform, 15, 800_000).0.is_finite());
+        let (ani, changed) = regional_ani(&uniform, 15, 800_001);
+        assert!(ani.is_nan() && !changed);
+        // Split leaves of 5 blocks pool 100000: a minimum above that leaves
+        // the split flagged without a regional estimate.
+        assert!(regional_ani(&alternating(), 15, 100_000).0.is_finite());
+        let (ani, changed) = regional_ani(&alternating(), 15, 100_001);
+        assert!(ani.is_nan() && changed);
+    }
+
+    #[test]
+    fn few_repeats_is_the_shared_anchor_repeat_ratio_at_full_identity() {
+        let p = params(21, 20, 15, 10, 42);
+        let mut genome = random_bases(8, 200_000);
+        let element = random_bases(7, 2_000);
+        for at in [10_000, 90_000, 150_000] {
+            genome[at..at + element.len()].copy_from_slice(&element);
+        }
+        let s = build(&fasta(&[&genome]), p.clone());
+        let anchors = s.anchors();
+        let repeated = anchors.hashes.len() - anchors.unique();
+        let m = candidate_blocks(&s, &s, &LocalConfig::default()).counts;
+        assert_eq!(m.shared_anchors as usize, anchors.unique());
+        assert_eq!(m.repeated_anchors as usize, repeated);
+        // About 100 repeated hashes against 9700 unique: under 2%.
+        assert!(repeated > 50 && few_repeats(&s), "{repeated}");
+        // An 8 kb element in 3 copies: about 400 repeated, over 2%.
+        let element = random_bases(9, 8_000);
+        for at in [10_000, 90_000, 150_000] {
+            genome[at..at + element.len()].copy_from_slice(&element);
+        }
+        assert!(!few_repeats(&build(&fasta(&[&genome]), p)));
     }
 
     fn substitute(sequence: &[u8], every: usize) -> Vec<u8> {

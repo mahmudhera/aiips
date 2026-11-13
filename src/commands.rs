@@ -583,7 +583,7 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
                 for (direction, proxy) in [("a", c.af_containment_a), ("b", c.af_containment_b)] {
                     if let Some(value) = proxy.filter(|&v| v > 1.0) {
                         eprintln!(
-                            "aiips: warning: af_containment_{direction} is {value:.6}, above 1: the homologous k-mer fraction model does not fit these inputs (repeats or incompleteness); it is a diagnostic, not AF"
+                            "aiips: warning: af_containment_{direction} is {value:.6}, above 1: the homologous k-mer fraction model does not fit these inputs (repeats or incompleteness); AF uses it, clipped to 1, only for fragmented inputs passing the uniformity and repeat guards"
                         );
                     }
                 }
