@@ -466,13 +466,31 @@ fn regional_ani(regions: &[Region], k: u32, min_pooled: u64) -> (f64, bool) {
 /// `repeated_anchors / shared_anchors` at 100% identity, measured on one
 /// genome: shared counts depend on divergence (a repeated hash is kept if any
 /// copy survives, a unique one only if its single copy does), this does not.
-fn few_repeats(sketch: &AiipsSketch) -> bool {
+fn few_repeats(sketch: &AiipsSketch, unique: usize) -> bool {
     let anchors = sketch.anchors();
-    let unique = anchors.unique();
     (anchors.hashes.len() - unique) * 50 < unique
 }
 
 pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analysis {
+    let global = super::estimate(a, b).ok();
+    analyze_impl(a, b, config, global.as_ref())
+}
+
+pub(crate) fn analyze_with_global(
+    a: &AiipsSketch,
+    b: &AiipsSketch,
+    config: &LocalConfig,
+    global: &super::AiipsEstimates,
+) -> Analysis {
+    analyze_impl(a, b, config, Some(global))
+}
+
+fn analyze_impl(
+    a: &AiipsSketch,
+    b: &AiipsSketch,
+    config: &LocalConfig,
+    global: Option<&super::AiipsEstimates>,
+) -> Analysis {
     let k1 = a.params.anchor_k.get() as u32;
     let k2 = a.params.probe_k.get() as u32;
     let candidates = candidate_blocks(a, b, config);
@@ -545,7 +563,7 @@ pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analys
     counts.covered_bases_a = covered(covered_a);
     counts.covered_bases_b = covered(covered_b);
 
-    let estimates = if counts.accepted_blocks == 0 {
+    let mut estimates = if counts.accepted_blocks == 0 {
         LocalEstimates {
             ani: None,
             q: None,
@@ -567,11 +585,23 @@ pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analys
         // diagnostics. C/q remains a k-mer model, not a base alignment.
         if (a.contigs().len() > 1 || b.contigs().len() > 1)
             && !heterogeneous
-            && few_repeats(a)
-            && few_repeats(b)
+            && few_repeats(
+                a,
+                candidates.unique_by_contig[0]
+                    .iter()
+                    .map(|&n| n as usize)
+                    .sum(),
+            )
+            && few_repeats(
+                b,
+                candidates.unique_by_contig[1]
+                    .iter()
+                    .map(|&n| n as usize)
+                    .sum(),
+            )
             && counts.excluded_repeats * 50 < counts.scoring_a + counts.scoring_b
         {
-            if let (Some(q), Ok(global)) = (q, super::estimate(a, b)) {
+            if let (Some(q), Some(global)) = (q, global) {
                 af_a = (global.containment_a_in_b / q).clamp(af_a, 1.0);
                 af_b = (global.containment_b_in_a / q).clamp(af_b, 1.0);
             }
@@ -596,6 +626,9 @@ pub fn analyze(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Analys
             counts,
         }
     };
+    if let Some(global) = global {
+        super::heterogeneous::adjust(a, b, &candidates, global, &mut estimates);
+    }
     Analysis {
         candidates,
         accepted,
@@ -669,13 +702,17 @@ mod tests {
         assert_eq!(m.shared_anchors as usize, anchors.unique());
         assert_eq!(m.repeated_anchors as usize, repeated);
         // About 100 repeated hashes against 9700 unique: under 2%.
-        assert!(repeated > 50 && few_repeats(&s), "{repeated}");
+        assert!(
+            repeated > 50 && few_repeats(&s, s.anchors().unique()),
+            "{repeated}"
+        );
         // An 8 kb element in 3 copies: about 400 repeated, over 2%.
         let element = random_bases(9, 8_000);
         for at in [10_000, 90_000, 150_000] {
             genome[at..at + element.len()].copy_from_slice(&element);
         }
-        assert!(!few_repeats(&build(&fasta(&[&genome]), p)));
+        let s = build(&fasta(&[&genome]), p);
+        assert!(!few_repeats(&s, s.anchors().unique()));
     }
 
     fn substitute(sequence: &[u8], every: usize) -> Vec<u8> {

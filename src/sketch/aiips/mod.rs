@@ -42,9 +42,13 @@
 //! [`local`]); [`compare`] reports both.
 
 pub mod blocks;
+mod decoded;
 mod format;
+mod heterogeneous;
+mod identity_mixture;
 pub mod local;
 pub mod occurrences;
+mod word_mixture;
 
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -578,7 +582,7 @@ pub fn compare(
     config: &LocalConfig,
 ) -> Result<AiipsComparison, String> {
     let global = estimate(a, b)?;
-    let local = local::estimate_local(a, b, config);
+    let local = local::analyze_with_global(a, b, config, &global).estimates;
     let proxy = |containment: f64| local.q.map(|q| containment / q);
     Ok(AiipsComparison {
         af_containment_a: proxy(global.containment_a_in_b),

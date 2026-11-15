@@ -79,6 +79,9 @@ pub struct Candidates {
     /// Non-overlapping candidate blocks, in match order.
     pub blocks: Vec<Block>,
     pub counts: MatchCounts,
+    /// Unique anchor occurrences per contig in A and B, cached while joining.
+    /// Used for repeat diagnostics and fragmented-genome sampling checks.
+    pub unique_by_contig: [Vec<u32>; 2],
 }
 
 impl Candidates {
@@ -129,10 +132,21 @@ fn single_occurrences(occurrences: &Occurrences) -> Vec<Option<usize>> {
 }
 
 /// Shared anchors of `a` and `b`, unsorted, and the count of repeated ones.
-fn shared_anchors(a: &AiipsSketch, b: &AiipsSketch) -> (Vec<AnchorMatch>, u64) {
+fn shared_anchors(a: &AiipsSketch, b: &AiipsSketch) -> (Vec<AnchorMatch>, u64, [Vec<u32>; 2]) {
     let k1 = a.params.anchor_k.get() as u32;
     let (anchors_a, anchors_b) = (a.anchors(), b.anchors());
     let (single_a, single_b) = (single_occurrences(anchors_a), single_occurrences(anchors_b));
+    let unique = |s: &AiipsSketch, single: &[Option<usize>]| {
+        (0..s.contigs().len())
+            .map(|c| {
+                s.contigs()
+                    .anchors(c)
+                    .filter(|&i| single[s.anchors().ids[i] as usize].is_some())
+                    .count() as u32
+            })
+            .collect()
+    };
+    let unique_by_contig = [unique(a, &single_a), unique(b, &single_b)];
     let (hashes_a, hashes_b) = (&anchors_a.hashes, &anchors_b.hashes);
     let (mut i, mut j) = (0, 0);
     let mut matches = Vec::new();
@@ -172,14 +186,14 @@ fn shared_anchors(a: &AiipsSketch, b: &AiipsSketch) -> (Vec<AnchorMatch>, u64) {
             }
         }
     }
-    (matches, repeated)
+    (matches, repeated, unique_by_contig)
 }
 
 /// Shared anchors, collinear runs and non-overlapping candidate blocks.
 /// The sketches must have identical parameters.
 pub fn candidate_blocks(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Candidates {
     let k1 = a.params.anchor_k.get() as u32;
-    let (mut matches, repeated) = shared_anchors(a, b);
+    let (mut matches, repeated, unique_by_contig) = shared_anchors(a, b);
     matches.sort_unstable_by_key(|m| (m.contig_a, m.contig_b, m.reverse, m.x));
     let mut counts = MatchCounts {
         shared_anchors: matches.len() as u64,
@@ -209,6 +223,7 @@ pub fn candidate_blocks(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) 
         matches,
         blocks,
         counts,
+        unique_by_contig,
     }
 }
 

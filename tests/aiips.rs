@@ -554,13 +554,54 @@ fn heterogeneous_identity_uses_local_survival_without_uniform_regression() {
             }
             let c = positional(&[&genome], &[&b], &defaults());
             let truth = 1.0 - substitutions as f64 / genome.len() as f64;
-            let tolerance = if rates[0] == rates[1] { 0.003 } else { 0.015 };
+            let tolerance = 0.003;
             assert!(
                 (c.local.ani.unwrap() - truth).abs() < tolerance,
                 "seed {seed}, rates {rates:?}: {:?} vs {truth}",
                 c.local.ani
             );
         }
+    }
+}
+
+#[test]
+fn short_mosaics_survive_fragmentation_reverse_orientation_and_sketch_roundtrip() {
+    let a = random_bases(20261114, 2_000_000);
+    let mut b = Vec::new();
+    let mut substitutions = 0;
+    for (i, chunk) in a.chunks(10_000).enumerate() {
+        let (part, n) = mutate(chunk, if i % 2 == 0 { 0.02 } else { 0.15 }, 900 + i as u64);
+        b.extend(part);
+        substitutions += n;
+    }
+    let truth = 1.0 - substitutions as f64 / a.len() as f64;
+    let sa = sketch(&[&a], &defaults());
+    for reverse in [false, true] {
+        let sequence = if reverse {
+            reverse_complement(&b)
+        } else {
+            b.clone()
+        };
+        let records = sequence.chunks(20_000).collect::<Vec<_>>();
+        let sb = sketch(&records, &defaults());
+        let c = compare(&sa, &sb, &LocalConfig::default()).unwrap();
+        assert!(
+            (c.local.ani.unwrap() - truth).abs() < 0.004,
+            "reverse={reverse}: {:?} vs {truth}",
+            c.local.ani
+        );
+        assert!(c.local.af_a.unwrap() > 0.97 && c.local.af_b.unwrap() > 0.97);
+        assert!(c.local.q.unwrap().powf(1.0 / 15.0) - c.local.ani.unwrap() > 0.015);
+        let aiips::sketch::Sketch::Aiips(loaded_a) = aiips::sketch::parse(&sa.to_bytes()).unwrap()
+        else {
+            panic!("AIIPS")
+        };
+        let aiips::sketch::Sketch::Aiips(loaded_b) = aiips::sketch::parse(&sb.to_bytes()).unwrap()
+        else {
+            panic!("AIIPS")
+        };
+        let loaded = compare(&loaded_a, &loaded_b, &LocalConfig::default()).unwrap();
+        assert_eq!(c.local, loaded.local);
     }
 }
 

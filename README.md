@@ -447,8 +447,9 @@ retained sets and `x` the size of their intersection:
 
 AIIPS `ani`, `af_a_to_b` and `af_b_to_a` are positional. They are never filled
 with a k-mer-set transform such as Mash ANI, and are `-1` when unsupported. The
-steps involve no alignment and no dynamic programming; each threshold has a
-flag (default in brackets):
+steps use sampled-word coordinates and comparisons, with no dynamic programming.
+The original block thresholds have flags (defaults in brackets); the additional
+heterogeneity safeguards below are internal experimental thresholds:
 
 1. *Shared anchors.* An anchor hash occurring exactly once in each genome
    is a shared anchor; repeated hashes are ignored. The relative orientation is
@@ -511,7 +512,58 @@ flag (default in brackets):
    diagnostics always retain raw observed coverage, so reported AF may exceed
    their ratio to genome length.
 
-These defaults favour divergent genomes; they are prototype values, not tuned.
+7. *Additional heterogeneous-identity estimate.* For canonical fmix64 sketches
+   with at least 500 kb per genome and 1,000 shared unique anchors, a conservative
+   dispatcher can replace the regional estimate. Define
+   `R = C_anchor_unique / (max_containment * q^((k1-k2)/k2))`. Under a uniform,
+   complete substitution model this is approximately one; heterogeneous identity
+   can increase it. Incomplete mappings and repeats can also change it, so it is
+   a screening statistic, not a significance test. A cheap preliminary screen
+   uses all retained anchor hashes. Fragmented genomes also use overdispersion of
+   shared unique-anchor counts among contigs to detect mixtures missed by the
+   pooled survival statistic.
+
+   The fmix64 permutation is inverted to recover sampled canonical k-mer words
+   already present in the sketch. Unique shared probe and anchor coordinates
+   establish constant-diagonal runs. Runs need two supports at least 50 bp apart,
+   permit gaps up to 15 kb, and mask their outer support seeds. Independently
+   selected overlapping words then provide literal base mismatch counts. Both
+   matching and mismatching interior words contribute. Same-family pairs with
+   equal starts or equal canonical words, and anchor pairs sharing the same
+   unordered selector endpoints, are excluded because their selection is coupled.
+   This avoids applying a nonlinear root to pooled heterogeneous survival.
+
+   The candidate ANI is 75% direct base identity and 25% a conditional-mismatch
+   estimate. The latter estimates mutation fraction as
+   `(1 - q_geometry) * E[K/k2 | K > 0]`, using full probe/anchor overlaps and their
+   mismatch counts `K`. These selection and substitution assumptions remain
+   approximations. At least 25,000 compared bases are required. The geometry-based
+   `R` must exceed 1.008 (1.015 for fragmented inputs), and the candidate must
+   lie at least 0.15 pp (0.25 pp for fragmented inputs) below the pooled root and
+   0.05 pp below the previous estimate. Otherwise the previous estimate remains.
+
+   Supported single-class mappings can project to contig ends. At least 500
+   compared terminal bases with identity below 70% disable ordinary terminal
+   projection. In this case a one-to-four-component binomial working mixture of
+   full-overlap mismatch counts can distinguish a population below 65% identity
+   from homologous sequence. It is used only with at least 1,000 observations
+   and an inferred homologous fraction between 0.50 and 0.97. For fragmented
+   inputs, the selected estimate can raise AF toward clipped
+   `homologous_fraction * C / q_geometry`, without reducing observed coverage.
+   `q`, raw coverage and containment diagnostics keep their original meanings;
+   the `af_containment_*` diagnostics still report the original `C/q` cross-check.
+
+   Frequent small diagonal steps (at least 20, over 0.5% of adjacent comparisons)
+   suggest indels. That branch instead fits one-to-three-component Poisson
+   working mixtures of mismatching-probe counts in 1 kb cells of the original
+   candidate blocks, allowing displaced matches. BIC selects the component count;
+   a multi-component fit replaces ANI only if it lowers the previous estimate
+   by over 0.05 pp. It does not change AF. These likelihoods treat dependent
+   overlapping words approximately and do not provide calibrated confidence
+   intervals. No additional sketch fields, CLI options or dependencies are used.
+
+The block defaults favour divergent genomes. The additional dispatcher and blend
+were selected on development simulations; they are provisional heuristics.
 
 **Why only the boundary anchors.** Excluding scoring probes that overlap *any*
 shared anchor of a block biases ANI downward: the remaining probes then
@@ -558,7 +610,8 @@ A diagnostics table follows the comparison row:
   - `insufficient_evidence` (blocks accepted, but scoring evidence too thin);
   - `no_supported_mapping` (no block accepted).
 
-Comparing two 5 Mbp sketches takes about 9 ms and 7 MB.
+The original block comparison of two 5 Mbp sketches took about 9 ms and 7 MB.
+Comparisons using the additional heterogeneous-identity branch require more work.
 
 Values are printed with six decimals. In the ideal model, MinHash estimates have
 sampling error of roughly `sqrt(J(1 - J)/s)` for Jaccard and `1/sqrt(s)` relative
@@ -587,6 +640,71 @@ Command-specific help takes precedence over invalid arguments anywhere before
 `--`. After `--`, `-h` and `--help` are literal filenames.
 
 ## Benchmark against skani
+
+### Expanded heterogeneous-identity evaluation
+
+A further round evaluated 736 development pairs (seeds 401–404), froze the
+selected strategy and its parameters, then evaluated 1,472 held-out pairs
+(seeds 501–508). The 39 scenario groups include short and long mosaics,
+unequal identity mixtures, indels, 2–5 kb drafts, independently fragmented
+genomes, novel contig tails, repeats and AT-rich sequence. The comparator is
+the pre-round implementation at commit `1bf815d`; skani is version 0.3.1,
+tested both with and without its learned correction. Missing estimates are
+counted separately and excluded from MAE, rather than assigned a numerical error.
+
+Held-out ANI mean absolute errors, in percentage points:
+
+| Scenario | Previous AIIPS | Selected AIIPS | skani | skani, no correction |
+| --- | ---: | ---: | ---: | ---: |
+| Mosaics, 50–500 kb regions | 0.718 | **0.061** | 0.521 | 0.379 |
+| Mosaics, 10–20 kb regions | 2.816 | **0.053** | 1.779 | 1.912 |
+| Three levels / minor divergent component | 0.570 | **0.042** | 0.176 | 0.103 |
+| Mosaics including 80% identity | 3.277 | **0.205** | 3.318 | 3.645 |
+| Mosaics with islands | 1.714 | **0.292** | 0.708 | 0.589 |
+| Fragmented mosaics | 2.472 | **0.055** | 0.219 | 0.784 |
+| Mosaics, 2 kb draft contigs | 6.105 | **0.929** | 3.189 | 4.214 |
+| Mosaics, novel 500 bp contig tails | 5.035 | **0.142** | 1.046 | 1.705 |
+| Low-contrast 99%/95% mosaics | 0.278 | 0.059 | 0.260 | **0.024** |
+
+Across all mosaic stress pairs, selected ANI MAE is 0.146 pp, down from
+2.388 pp. Mean paired improvement is 2.242 pp; a bootstrap resampling the eight
+held-out seeds gives an interval of 2.202–2.285 pp. This interval measures
+simulation-seed variability, not uncertainty for real-genome ANI. Fragmented
+mosaic AF MAE falls from 20.265 pp to below 0.001 pp; for 2 kb mosaic drafts it
+falls from 63.695 pp to 7.366 pp. Low-contrast mosaics remain less accurate than
+uncorrected skani. Predictions in nonmosaic groups that previously beat both
+skani variants are unchanged. One held-out draft-with-indels pair has an additional 0.067 pp
+ANI error; that group's mean increases by 0.0042 pp. Thus this is not a guarantee
+of pairwise nonregression.
+
+Selection compared decoded-word, conditional-mismatch, spatial mixture,
+fragment-dispersion and terminal-background strategies. Shorter anchors (17 and
+19) caused accuracy regressions; a denser probe scale of 100 improved development
+accuracy but was not selected because of cost. Defaults remain anchor length 21,
+probe length 15 and probe scale 125. The 75/25 blend and dispatcher thresholds
+were selected before held-out evaluation. Production predictions match the frozen
+research implementation on all 2,208 pairs to six-decimal output precision.
+
+These are simulation results. They do not establish accuracy against real
+base-level alignments or guarantee the screening and mixture assumptions under
+repeats, errors, novel sequence or extreme fragmentation. The selected estimator
+adds work on heterogeneous inputs; the original matched-budget figures below
+do not measure this version. Local scripts, complete tables and plots for this
+round are retained in `analysis/2026-11-13-round3/`, separately from previous
+experimental results.
+
+The final cost run used 368 pairs, single-threaded from FASTA, with five rotated
+timing repeats per tool and a separate peak-RSS measurement. Median per-pair
+selected/previous time ratios are 1.008 overall, 1.158 for mosaics and 1.004 for
+nonmosaics. Selected/skani ratios are 1.042 overall and 1.176 for mosaics;
+overall peak RSS is 0.956 times skani's. The median over previously winning
+nonmosaic groups is 1.004, but this hides a material exception: drafts with
+islands take 1.127 times the previous runtime despite unchanged predictions.
+Novel-tail mosaics take 1.316 times the previous runtime. Therefore the selected
+strategy improves accuracy but does not meet either strict runtime parity with
+skani or a guarantee of unchanged cost in every previously winning scenario.
+
+### Earlier evaluations
 
 The original figures below precede the regional ANI and fragmented-AF
 corrections. A rerun on the same 252 pairs reduces mosaic ANI MAE from 2.19 to
