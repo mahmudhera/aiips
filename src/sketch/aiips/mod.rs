@@ -48,6 +48,7 @@ mod heterogeneous;
 mod identity_mixture;
 pub mod local;
 pub mod occurrences;
+pub mod runs;
 mod word_mixture;
 
 use std::io::Read;
@@ -60,10 +61,11 @@ use super::{invalid, ParseError};
 use crate::fastx::{summarize_counted, Summary};
 use crate::hash::{fmix64, SplitMix64};
 use crate::kmer::CODES;
-pub use local::{LocalConfig, LocalEstimates, LocalStatus};
+pub use local::{LocalConfig, LocalEstimates, LocalMethod, LocalStatus};
 use occurrences::link_islands;
 use occurrences::OccurrenceBuilder;
 pub use occurrences::{Bits, Contigs, Occurrences};
+pub use runs::RunCounts;
 
 pub const DEFAULT_ANCHOR_K: usize = 21;
 pub const DEFAULT_ANCHOR_SCALED: u64 = 125;
@@ -582,7 +584,10 @@ pub fn compare(
     config: &LocalConfig,
 ) -> Result<AiipsComparison, String> {
     let global = estimate(a, b)?;
-    let local = local::analyze_with_global(a, b, config, &global).estimates;
+    let local = match config.method {
+        LocalMethod::Blocks => local::analyze_with_global(a, b, config, &global).estimates,
+        LocalMethod::Runs => runs::estimate(a, b, config),
+    };
     let proxy = |containment: f64| local.q.map(|q| containment / q);
     Ok(AiipsComparison {
         af_containment_a: proxy(global.containment_a_in_b),

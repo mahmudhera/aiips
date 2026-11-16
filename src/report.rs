@@ -106,6 +106,9 @@ pub fn aiips_build(
 /// Header of the AIIPS diagnostics table.
 pub const AIIPS_DIAGNOSTICS: &str = "input_a\tinput_b\tglobal_a\tglobal_b\tglobal_shared\tmax_containment\tputative_ani\tshared_anchors\trepeated_anchors\tbreaks_order\tbreaks_gap\tbreaks_ratio\tcandidate_blocks\toverlapping_blocks\trejected_few_hits\trejected_disorder\taccepted_blocks\tmapping_hits\tscoring_a\tscoring_b\tscoring_shared\texcluded_boundary_overlap\texcluded_repeats\tcovered_bases_a\tcovered_bases_b\taf_containment_a\taf_containment_b\tjaccard_status\tcontainment_status\tani_status\taf_status";
 
+/// Header of the AIIPS diagnostics table for `--local-method runs`.
+pub const AIIPS_RUN_DIAGNOSTICS: &str = "input_a\tinput_b\tglobal_a\tglobal_b\tglobal_shared\tmax_containment\tputative_ani\tlocal_method\tseeds\tseeds_absorbed\truns_built\tstops_gap\tstops_end\tambiguous_supports\truns_short\truns_trimmed\truns_dropped\taccepted_runs\tsupports\tprobes_a\tprobes_b\tmatched_a\tmatched_b\tcovered_bases_a\tcovered_bases_b\taf_containment_a\taf_containment_b\tjaccard_status\tcontainment_status\tani_status\taf_status";
+
 /// AIIPS comparison: the shared table with positional ANI and AF (-1 when
 /// unsupported), then counts for every stage and per-estimate statuses.
 pub fn aiips_comparison(
@@ -121,6 +124,41 @@ pub fn aiips_comparison(
         [l.ani, l.af_a, l.af_b],
         [g.ani_containment_a_in_b, g.ani_containment_b_in_a],
     )?;
+    if let Some(r) = &l.runs {
+        writeln!(output, "\n{AIIPS_RUN_DIAGNOSTICS}")?;
+        return writeln!(
+            output,
+            "{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\truns\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\testimated\testimated\t{}\t{}",
+            label(inputs[0].as_ref()),
+            label(inputs[1].as_ref()),
+            g.global_a,
+            g.global_b,
+            g.global_shared,
+            g.max_containment,
+            g.putative_ani,
+            r.seeds,
+            r.seeds_absorbed,
+            r.runs_built,
+            r.stops_gap,
+            r.stops_end,
+            r.ambiguous,
+            r.runs_short,
+            r.runs_trimmed,
+            r.runs_dropped,
+            r.accepted_runs,
+            r.supports,
+            r.probes_a,
+            r.probes_b,
+            r.matched_a,
+            r.matched_b,
+            r.covered_bases_a,
+            r.covered_bases_b,
+            value(c.af_containment_a),
+            value(c.af_containment_b),
+            l.ani_status.name(),
+            l.af_status.name(),
+        );
+    }
     let n = &l.counts;
     let m = &n.matching;
     writeln!(output, "\n{AIIPS_DIAGNOSTICS}")?;

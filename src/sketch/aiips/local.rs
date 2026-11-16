@@ -49,6 +49,7 @@
 use std::ops::Range;
 
 use super::blocks::{candidate_blocks, Candidates, MatchCounts};
+use super::runs::RunCounts;
 use super::{AiipsSketch, Role};
 
 pub const DEFAULT_MIN_BLOCK_SPAN: u32 = 10_000;
@@ -57,6 +58,32 @@ pub const DEFAULT_MAX_GAP_RATIO: f64 = 2.0;
 pub const DEFAULT_MIN_MAPPING_HITS: u32 = 3;
 pub const DEFAULT_MIN_ORDER_FRACTION: f64 = 0.8;
 pub const DEFAULT_MIN_SCORING_PROBES: u64 = 50;
+pub const DEFAULT_RUN_GAP_FACTOR: f64 = 10.0;
+pub const DEFAULT_RUN_MAX_GAP: u32 = 20_000;
+pub const DEFAULT_RUN_BAND: u32 = 100;
+pub const DEFAULT_RUN_MIN_SUPPORTS: u32 = 3;
+/// One support (the seed alone) cannot establish homology.
+pub const LEAST_RUN_SUPPORTS: u32 = 2;
+
+/// How positional ANI and AF are computed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LocalMethod {
+    /// Collinear shared anchors cut into blocks, validated by mapping probes.
+    #[default]
+    Blocks,
+    /// Runs seeded by shared anchors and extended by anchors and probes
+    /// (see [`super::runs`]).
+    Runs,
+}
+
+impl LocalMethod {
+    pub fn name(self) -> &'static str {
+        match self {
+            LocalMethod::Blocks => "blocks",
+            LocalMethod::Runs => "runs",
+        }
+    }
+}
 /// One or two matching probes cannot establish homology.
 pub const LEAST_MAPPING_HITS: u32 = 2;
 
@@ -75,6 +102,18 @@ pub struct LocalConfig {
     pub min_order_fraction: f64,
     /// Pooled eligible scoring probes (N_A + N_B) needed for ANI.
     pub min_scoring_probes: u64,
+    pub method: LocalMethod,
+    /// Runs: a gap may reach this many times the run's expected spacing
+    /// between supports.
+    pub run_gap_factor: f64,
+    /// Runs: the largest gap without support, in bases.
+    pub run_max_gap: u32,
+    /// Runs: largest change of offset (B − A position) between supports.
+    pub run_band: u32,
+    /// Runs: supports needed to accept a run, seed included (at least 2).
+    pub run_min_supports: u32,
+    /// Runs: AF padding on each side of a run; `None` is the probe scale.
+    pub run_pad: Option<u32>,
 }
 
 impl Default for LocalConfig {
@@ -86,6 +125,12 @@ impl Default for LocalConfig {
             min_mapping_hits: DEFAULT_MIN_MAPPING_HITS,
             min_order_fraction: DEFAULT_MIN_ORDER_FRACTION,
             min_scoring_probes: DEFAULT_MIN_SCORING_PROBES,
+            method: LocalMethod::Blocks,
+            run_gap_factor: DEFAULT_RUN_GAP_FACTOR,
+            run_max_gap: DEFAULT_RUN_MAX_GAP,
+            run_band: DEFAULT_RUN_BAND,
+            run_min_supports: DEFAULT_RUN_MIN_SUPPORTS,
+            run_pad: None,
         }
     }
 }
@@ -116,6 +161,21 @@ impl LocalConfig {
         }
         if self.min_scoring_probes == 0 {
             return Err("min_scoring_probes must be at least 1".into());
+        }
+        if !(self.run_gap_factor.is_finite() && self.run_gap_factor > 0.0) {
+            return Err(format!(
+                "run_gap_factor must be a finite number above 0, got {}",
+                self.run_gap_factor
+            ));
+        }
+        if self.run_max_gap == 0 {
+            return Err("run_max_gap must be at least 1".into());
+        }
+        if self.run_min_supports < LEAST_RUN_SUPPORTS {
+            return Err(format!(
+                "run_min_supports must be at least {LEAST_RUN_SUPPORTS}, got {}",
+                self.run_min_supports
+            ));
         }
         Ok(())
     }
@@ -177,6 +237,8 @@ pub struct LocalEstimates {
     pub ani_status: LocalStatus,
     pub af_status: LocalStatus,
     pub counts: LocalCounts,
+    /// Run-method counters; `None` for blocks.
+    pub runs: Option<RunCounts>,
 }
 
 /// Every stage's result: candidate blocks, which were accepted, and the estimates.
@@ -338,7 +400,7 @@ fn score(a: &mut Entries, b: &mut Entries, repeats: &mut u64) -> (u64, u64, u64)
 }
 
 /// Total length of the union of half-open (contig, start, end) intervals.
-fn covered(mut intervals: Vec<(usize, u64, u64)>) -> u64 {
+pub(crate) fn covered(mut intervals: Vec<(usize, u64, u64)>) -> u64 {
     intervals.sort_unstable();
     let mut total = 0;
     let mut current: Option<(usize, u64, u64)> = None;
@@ -572,6 +634,7 @@ fn analyze_impl(
             ani_status: LocalStatus::NoSupportedMapping,
             af_status: LocalStatus::NoSupportedMapping,
             counts,
+            runs: None,
         }
     } else {
         let q = survival(&counts, config);
@@ -624,6 +687,7 @@ fn analyze_impl(
             },
             af_status: LocalStatus::Estimated,
             counts,
+            runs: None,
         }
     };
     if let Some(global) = global {

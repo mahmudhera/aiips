@@ -2,15 +2,15 @@ use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use aiips::sketch::aiips::local::LEAST_MAPPING_HITS;
-use aiips::sketch::aiips::{self as aiips_sketch, AiipsParams, LocalConfig};
+use aiips::sketch::aiips::local::{LEAST_MAPPING_HITS, LEAST_RUN_SUPPORTS};
+use aiips::sketch::aiips::{self as aiips_sketch, AiipsParams, LocalConfig, LocalMethod};
 use aiips::sketch::fracminhash::{self, FracMinHashParams};
 use aiips::sketch::minhash::{self, MinHashParams, MAX_NUM_HASHES, MIN_NUM_HASHES};
 use aiips::sketch::{Algorithm, Sketch};
 
 pub const HELP: &str = "Usage: aiips <COMMAND>\n\nCommands:\n  sketch   Sketch a FASTA/FASTQ file into a .aiips file\n  compare  Estimate similarity between two .aiips sketches\n\nUse aiips <COMMAND> --help for options. Stdin is not supported.";
 const SKETCH_HELP: &str = "Usage: aiips sketch INPUT -o OUTPUT [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED] [--probe-k K2] [--probe-scaled C2] [--anchor-k K1] [--anchor-scaled C1] [-f]\n\n  -o, --output PATH         Output path (.aiips appended if missing)\n  -a, --algorithm NAME      Sketch algorithm: minhash, fracminhash or aiips\n                            [default: minhash]\n  -k, --kmer-size LENGTH    minhash, fracminhash: k-mer length, 1 to 32 [default: 21]\n  -s, --num-hashes NUM      minhash: number of hash functions, 2 to 1000000 [default: 1000]\n      --scaled S            fracminhash: scale factor, keeps about 1/S of k-mers,\n                            1 to 18446744073709551615 [default: 1000]\n      --probe-k K2          aiips: probe k-mer length, odd, 1 to 31 [default: 15]\n      --probe-scaled C2     aiips: probe scale factor, keeps about 1/C2 of k-mers,\n                            1 to 18446744073709551615 [default: 125]\n      --anchor-k K1         aiips: anchor k-mer length, odd, 1 to 31 [default: 21]\n      --anchor-scaled C1    aiips: anchor scale factor, keeps about 1/C1 of k-mers,\n                            1 to 18446744073709551615 [default: 125]\n      --seed SEED           unsigned 64-bit hash seed [default: 42]\n  -f, --force               Replace an existing output\n  -h, --help                Print help\n\nReads plain/gzip FASTA or FASTQ; k-mers are canonical (strand-independent).\nReserved, not yet implemented: bottomk, minimizer, open-syncmer, closed-syncmer,\nstrobemer.\nUse -- before positional filenames beginning with -. Stdin is not supported.";
-const COMPARE_HELP: &str = "Usage: aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED] [--probe-k K2] [--probe-scaled C2] [--anchor-k K1] [--anchor-scaled C1] [aiips thresholds]\n\n  -a, --algorithm NAME     Algorithm for FASTA/FASTQ inputs: minhash, fracminhash or\n                           aiips [default: minhash, or the sketch's algorithm]\n  -k, --kmer-size LENGTH   minhash, fracminhash: k-mer length [default: 21, or the\n                           sketch's k]\n  -s, --num-hashes NUM     minhash: number of hash functions [default: 1000]\n      --scaled S           fracminhash: scale factor [default: 1000]\n      --probe-k K2         aiips: probe k-mer length [default: 15]\n      --probe-scaled C2    aiips: probe scale factor [default: 125]\n      --anchor-k K1        aiips: anchor k-mer length [default: 21]\n      --anchor-scaled C1   aiips: anchor scale factor [default: 125]\n      --seed SEED          unsigned 64-bit hash seed [default: 42]\n  -h, --help               Print help\n\naiips thresholds for positional ANI and AF (prototype defaults, not tuned):\n      --min-block-span N        cut a block once its span reaches N bases [default: 10000]\n      --max-anchor-gap N        break a run at a larger gap between shared anchors\n                                [default: 50000]\n      --max-gap-ratio R         break a run when gaps differ by more than R times\n                                [default: 2]\n      --min-mapping-hits N      mapping-probe hits to accept a block, at least 2\n                                [default: 3]\n      --min-order-fraction F    share of hits in collinear order, 0 to 1 [default: 0.8]\n      --min-scoring-probes N    pooled scoring probes needed for ANI [default: 50]\n\nEach input is a .aiips sketch or a plain/gzip FASTA/FASTQ file; mixed pairs are\nsupported. Sequence inputs are sketched in memory, using the other input's\nalgorithm and parameters when it is a sketch (given options must then match),\notherwise the options above. Sketches must share one algorithm and identical\nparameters. Prints Jaccard, containment and ANI estimates; AF is -1: it is not\nestimable from these sketches. For aiips, ANI and AF come from shared anchors and\nvalidated blocks and are -1 when unsupported; a table of counts and statuses follows.\nUse -- before positional filenames beginning with -. Stdin is not supported.";
+const COMPARE_HELP: &str = "Usage: aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED] [--probe-k K2] [--probe-scaled C2] [--anchor-k K1] [--anchor-scaled C1] [aiips thresholds]\n\n  -a, --algorithm NAME     Algorithm for FASTA/FASTQ inputs: minhash, fracminhash or\n                           aiips [default: minhash, or the sketch's algorithm]\n  -k, --kmer-size LENGTH   minhash, fracminhash: k-mer length [default: 21, or the\n                           sketch's k]\n  -s, --num-hashes NUM     minhash: number of hash functions [default: 1000]\n      --scaled S           fracminhash: scale factor [default: 1000]\n      --probe-k K2         aiips: probe k-mer length [default: 15]\n      --probe-scaled C2    aiips: probe scale factor [default: 125]\n      --anchor-k K1        aiips: anchor k-mer length [default: 21]\n      --anchor-scaled C1   aiips: anchor scale factor [default: 125]\n      --seed SEED          unsigned 64-bit hash seed [default: 42]\n  -h, --help               Print help\n\naiips thresholds for positional ANI and AF (prototype defaults, not tuned):\n      --min-block-span N        cut a block once its span reaches N bases [default: 10000]\n      --max-anchor-gap N        break a run at a larger gap between shared anchors\n                                [default: 50000]\n      --max-gap-ratio R         break a run when gaps differ by more than R times\n                                [default: 2]\n      --min-mapping-hits N      mapping-probe hits to accept a block, at least 2\n                                [default: 3]\n      --min-order-fraction F    share of hits in collinear order, 0 to 1 [default: 0.8]\n      --min-scoring-probes N    pooled scoring probes needed for ANI [default: 50]\n      --local-method NAME       blocks (anchor blocks validated by probes) or runs\n                                (anchor-seeded runs extended by anchors and probes)\n                                [default: blocks]\n\nruns thresholds (with --local-method runs; prototype defaults, not tuned):\n      --run-gap-factor T        stop at a gap above T times the run's expected spacing\n                                between supports [default: 10]\n      --run-max-gap N           stop at a gap above N bases [default: 20000]\n      --run-band W              largest shift of B - A offset between supports\n                                [default: 100]\n      --run-min-supports N      supports to accept a run, at least 2 [default: 3]\n      --run-pad N               AF padding on each side of a run [default: probe\n                                scale C2]\n\nThe block thresholds above (all but --min-scoring-probes) apply to blocks only.\n\nEach input is a .aiips sketch or a plain/gzip FASTA/FASTQ file; mixed pairs are\nsupported. Sequence inputs are sketched in memory, using the other input's\nalgorithm and parameters when it is a sketch (given options must then match),\notherwise the options above. Sketches must share one algorithm and identical\nparameters. Prints Jaccard, containment and ANI estimates; AF is -1: it is not\nestimable from these sketches. For aiips, ANI and AF come from shared anchors and\nvalidated blocks (or runs) and are -1 when unsupported; a table of counts and\nstatuses follows.\nUse -- before positional filenames beginning with -. Stdin is not supported.";
 
 /// Validated parameters for building one sketch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,9 +255,41 @@ pub struct LocalOptions {
     pub min_mapping_hits: Option<u32>,
     pub min_order_fraction: Option<f64>,
     pub min_scoring_probes: Option<u64>,
+    pub method: Option<LocalMethod>,
+    pub run_gap_factor: Option<f64>,
+    pub run_max_gap: Option<u32>,
+    pub run_band: Option<u32>,
+    pub run_min_supports: Option<u32>,
+    pub run_pad: Option<u32>,
 }
 
 impl LocalOptions {
+    /// The first given blocks-only flag.
+    fn first_block_flag(&self) -> Option<&'static str> {
+        [
+            (self.min_block_span.is_some(), "--min-block-span"),
+            (self.max_anchor_gap.is_some(), "--max-anchor-gap"),
+            (self.max_gap_ratio.is_some(), "--max-gap-ratio"),
+            (self.min_mapping_hits.is_some(), "--min-mapping-hits"),
+            (self.min_order_fraction.is_some(), "--min-order-fraction"),
+        ]
+        .into_iter()
+        .find_map(|(given, flag)| given.then_some(flag))
+    }
+
+    /// The first given runs-only flag.
+    fn first_run_flag(&self) -> Option<&'static str> {
+        [
+            (self.run_gap_factor.is_some(), "--run-gap-factor"),
+            (self.run_max_gap.is_some(), "--run-max-gap"),
+            (self.run_band.is_some(), "--run-band"),
+            (self.run_min_supports.is_some(), "--run-min-supports"),
+            (self.run_pad.is_some(), "--run-pad"),
+        ]
+        .into_iter()
+        .find_map(|(given, flag)| given.then_some(flag))
+    }
+
     /// The first given flag, for refusing them with other algorithms.
     pub fn first_given(&self) -> Option<&'static str> {
         [
@@ -267,19 +299,37 @@ impl LocalOptions {
             (self.min_mapping_hits.is_some(), "--min-mapping-hits"),
             (self.min_order_fraction.is_some(), "--min-order-fraction"),
             (self.min_scoring_probes.is_some(), "--min-scoring-probes"),
+            (self.method.is_some(), "--local-method"),
         ]
         .into_iter()
         .find_map(|(given, flag)| given.then_some(flag))
+        .or_else(|| self.first_run_flag())
     }
 
-    /// Refuses given thresholds unless `algorithm` is aiips.
+    /// Refuses given thresholds unless `algorithm` is aiips, and thresholds
+    /// of the local method not selected.
     pub fn check_applicable(&self, algorithm: Algorithm) -> Result<(), String> {
         match self.first_given() {
-            Some(flag) if algorithm != Algorithm::Aiips => Err(format!(
-                "{flag} applies only to aiips, not {}",
-                algorithm.name()
+            Some(flag) if algorithm != Algorithm::Aiips => {
+                return Err(format!(
+                    "{flag} applies only to aiips, not {}",
+                    algorithm.name()
+                ))
+            }
+            _ => {}
+        }
+        let method = self.method.unwrap_or_default();
+        let (wrong, owner) = match method {
+            LocalMethod::Blocks => (self.first_run_flag(), LocalMethod::Runs),
+            LocalMethod::Runs => (self.first_block_flag(), LocalMethod::Blocks),
+        };
+        match wrong {
+            Some(flag) => Err(format!(
+                "{flag} applies only to --local-method {}, not {}",
+                owner.name(),
+                method.name()
             )),
-            _ => Ok(()),
+            None => Ok(()),
         }
     }
 
@@ -293,6 +343,12 @@ impl LocalOptions {
             min_mapping_hits: self.min_mapping_hits.unwrap_or(d.min_mapping_hits),
             min_order_fraction: self.min_order_fraction.unwrap_or(d.min_order_fraction),
             min_scoring_probes: self.min_scoring_probes.unwrap_or(d.min_scoring_probes),
+            method: self.method.unwrap_or(d.method),
+            run_gap_factor: self.run_gap_factor.unwrap_or(d.run_gap_factor),
+            run_max_gap: self.run_max_gap.unwrap_or(d.run_max_gap),
+            run_band: self.run_band.unwrap_or(d.run_band),
+            run_min_supports: self.run_min_supports.unwrap_or(d.run_min_supports),
+            run_pad: self.run_pad.or(d.run_pad),
         }
     }
 }
@@ -477,6 +533,37 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         } else if compare_option && arg == "--min-scoring-probes" {
             once(&local.min_scoring_probes, "min scoring probes", help)?;
             local.min_scoring_probes = Some(at_least(args.next(), 1, SCORING_PROBES_RANGE, help)?);
+        } else if compare_option && arg == "--local-method" {
+            once(&local.method, "local method", help)?;
+            local.method = Some(match args.next().as_ref().and_then(|v| v.to_str()) {
+                Some("blocks") => LocalMethod::Blocks,
+                Some("runs") => LocalMethod::Runs,
+                _ => return Err(format!("{LOCAL_METHOD_RANGE}\n{help}")),
+            });
+        } else if compare_option && arg == "--run-gap-factor" {
+            once(&local.run_gap_factor, "run gap factor", help)?;
+            let factor = fraction(args.next(), 0.0..=f64::MAX, RUN_GAP_FACTOR_RANGE, help)?;
+            if factor == 0.0 {
+                return Err(format!("{RUN_GAP_FACTOR_RANGE}\n{help}"));
+            }
+            local.run_gap_factor = Some(factor);
+        } else if compare_option && arg == "--run-max-gap" {
+            once(&local.run_max_gap, "run max gap", help)?;
+            local.run_max_gap = Some(at_least(args.next(), 1, RUN_MAX_GAP_RANGE, help)?);
+        } else if compare_option && arg == "--run-band" {
+            once(&local.run_band, "run band", help)?;
+            local.run_band = Some(number(args.next(), RUN_BAND_RANGE, help)?);
+        } else if compare_option && arg == "--run-min-supports" {
+            once(&local.run_min_supports, "run min supports", help)?;
+            local.run_min_supports = Some(at_least(
+                args.next(),
+                LEAST_RUN_SUPPORTS,
+                RUN_MIN_SUPPORTS_RANGE,
+                help,
+            )?);
+        } else if compare_option && arg == "--run-pad" {
+            once(&local.run_pad, "run pad", help)?;
+            local.run_pad = Some(number(args.next(), RUN_PAD_RANGE, help)?);
         } else if sketch_option && (arg == "-o" || arg == "--output") {
             if output.is_some() {
                 return Err(format!("output may only be specified once\n{help}"));
@@ -539,6 +626,12 @@ const MAPPING_HITS_RANGE: &str = "min mapping hits must be an integer from 2 to 
 const ORDER_FRACTION_RANGE: &str = "min order fraction must be a number from 0 to 1";
 const SCORING_PROBES_RANGE: &str =
     "min scoring probes must be an integer from 1 to 18446744073709551615";
+const LOCAL_METHOD_RANGE: &str = "local method must be blocks or runs";
+const RUN_GAP_FACTOR_RANGE: &str = "run gap factor must be a finite number above 0";
+const RUN_MAX_GAP_RANGE: &str = "run max gap must be an integer from 1 to 4294967295";
+const RUN_BAND_RANGE: &str = "run band must be an integer from 0 to 4294967295";
+const RUN_MIN_SUPPORTS_RANGE: &str = "run min supports must be an integer from 2 to 4294967295";
+const RUN_PAD_RANGE: &str = "run pad must be an integer from 0 to 4294967295";
 const PROBE_K_RANGE: &str = "probe k-mer length must be an odd integer from 1 to 31";
 const PROBE_SCALED_RANGE: &str = "probe scaled must be an integer from 1 to 18446744073709551615";
 const ANCHOR_K_RANGE: &str = "anchor k-mer length must be an odd integer from 1 to 31";

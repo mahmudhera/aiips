@@ -336,7 +336,11 @@ aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [
 The aiips thresholds (`--min-block-span`, `--max-anchor-gap`, `--max-gap-ratio`,
 `--min-mapping-hits`, `--min-order-fraction`, `--min-scoring-probes`) apply only
 to AIIPS comparisons and are errors with other algorithms. They are described
-under AIIPS estimators below.
+under AIIPS estimators below. `--local-method blocks|runs` [blocks] selects how
+positional ANI and AF are computed; the block thresholds except
+`--min-scoring-probes` apply to blocks only, and `--run-gap-factor`,
+`--run-max-gap`, `--run-band`, `--run-min-supports` and `--run-pad` apply to runs
+only (see *Run method* below).
 
 Each input is a sketch or a plain/gzip FASTA/FASTQ file; mixed pairs are
 supported, so commands written before sketches existed keep working. Files named
@@ -610,6 +614,68 @@ A diagnostics table follows the comparison row:
   - `insufficient_evidence` (blocks accepted, but scoring evidence too thin);
   - `no_supported_mapping` (no block accepted).
 
+#### Run method (`--local-method runs`)
+
+An alternative to blocks: shared anchors start runs, and the anchors and
+probes that follow extend them, across further anchors, until a gap without
+support ends them. Every probe takes part in both extension and measurement
+(no mapping/scoring split), and none of the corrections for fragmented or
+mixed-identity inputs described above is applied. The defaults are prototype
+values, not tuned.
+
+1. *Seeds.* An anchor hash occurring exactly once on a contig of A and exactly
+   once on a contig of B seeds a run for that contig pair, even if it occurs on
+   other contigs. Orientation and oriented B coordinates are as for blocks.
+2. *Supports.* From the seed, A's anchors and probes are visited in position
+   order, to the right and then to the left. A k-mer is a support when its hash
+   has exactly one occurrence on the run's B contig with the run's strand
+   relation, an offset (B − A position) within `--run-band` [100] of the last
+   support's offset, and a B position moving in the walk's direction. A shared
+   anchor reached as a support starts no run of its own.
+3. *Stop.* A walk ends at the contig end, at the end of the previous run of the
+   same contig pair (left walks), or when the gap since the last support, in A
+   or B, exceeds `G = min(--run-max-gap [20000], --run-gap-factor [10] · s · n / m)`.
+   Here `s = 1 / (1/c1 + 1/c2)` is the expected number of A bases per sampled
+   k-mer, `n` the k-mers visited and `m` the supports, seed included; with only
+   the seed, `G = --run-max-gap`. `s · n / m` estimates the run's spacing
+   between supports from its hit rate. This is a heuristic stopping rule, not a
+   calibrated test: in identical sequence, a run stops early about once every
+   `s · e^t` bases (1.4 Mb at the defaults), and the next seed starts a new run.
+4. *Accept.* A run needs `--run-min-supports` [3] supports, seed included. Where
+   runs overlap on either genome, the run with more supports is kept and the
+   other keeps only its supports outside it; pieces with too few supports are
+   dropped.
+5. *ANI.* Every probe occurrence inside an accepted run counts, including the
+   run's end supports, probes overlapping anchors, and repeated hashes; an
+   occurrence matches when its hash occurs in the other genome's run interval.
+   `q = (X_A + X_B) / (N_A + N_B)` pooled over runs, and `ANI = q^(1/k2)`; null
+   under the conditions given for blocks (`--min-scoring-probes` applies).
+6. *AF.* Each run interval is padded by `--run-pad` bases on both sides (default:
+   the probe scale `c2`, as skani pads its chains by its `c`), clipped to the
+   contig; AF is the union divided by the genome's bases.
+
+ANI reads high on genomes with repeats, most likely because a repeated hash
+counts as matched when any copy survives: on simulated
+E. coli pairs with uniform substitutions it read 0.04-0.05 pp high at 99%,
+0.12-0.19 pp at 95% and 0.46-0.56 pp at 90%, against -0.01 to +0.14 pp on random
+sequence. To be investigated later: using the indel shifts within the band in
+the ANI estimate; correcting for the matches at run ends; a joint probe and anchor
+likelihood (leaving out probes that overlap anchors); the fragment and
+mixed-identity corrections; and probes as seeds for short contigs.
+
+The diagnostics table for runs has `local_method` (`runs`) followed by:
+- `seeds`, `seeds_absorbed`: seed pairs, and seeds reached by an earlier run;
+- `runs_built`, `stops_gap`, `stops_end`: runs extended, and walks ended by the
+  gap rule or by a contig end or earlier run;
+- `ambiguous_supports`: k-mers with two or more B copies inside the band;
+- `runs_short`, `runs_trimmed`, `runs_dropped`: runs below the support minimum,
+  trimmed by overlaps, and dropped by overlaps;
+- `accepted_runs`, `supports`;
+- `probes_a`, `probes_b`, `matched_a`, `matched_b`: `N_A`, `N_B`, `X_A`, `X_B`;
+- `covered_bases_a`, `covered_bases_b`: AF numerators.
+
+The global columns, `af_containment_*` and statuses are as for blocks.
+
 The original block comparison of two 5 Mbp sketches took about 9 ms and 7 MB.
 Comparisons using the additional heterogeneous-identity branch require more work.
 
@@ -846,8 +912,8 @@ cd scripts/skani_benchmark && python3 cost.py --pairs ../../data/test_against_sk
   varints, sections, FNV-1a 64), and AIIPS in `aiips/`: sampling, island
   navigation and estimators (`mod.rs`), dictionary-encoded occurrence columns
   and the contig table (`occurrences.rs`), the file layout (`format.rs`),
-  shared anchors and candidate blocks (`blocks.rs`), and validation, ANI and AF
-  (`local.rs`). FracMinHash and AIIPS comparisons merge two sorted sketches in
+  shared anchors and candidate blocks (`blocks.rs`), validation, ANI and AF
+  (`local.rs`), and the run method (`runs.rs`). FracMinHash and AIIPS comparisons merge two sorted sketches in
   linear time; shared anchors are found by merging the two sorted anchor
   dictionaries.
 - The binary separates argument parsing, command execution and output handling,

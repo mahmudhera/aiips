@@ -2929,3 +2929,275 @@ fn af_containment_above_one_is_reported_with_a_warning() {
         "both cases exercised: {above} {not_above}"
     );
 }
+
+const AIIPS_RUN_DIAGNOSTICS: &str = "input_a\tinput_b\tglobal_a\tglobal_b\tglobal_shared\tmax_containment\tputative_ani\tlocal_method\tseeds\tseeds_absorbed\truns_built\tstops_gap\tstops_end\tambiguous_supports\truns_short\truns_trimmed\truns_dropped\taccepted_runs\tsupports\tprobes_a\tprobes_b\tmatched_a\tmatched_b\tcovered_bases_a\tcovered_bases_b\taf_containment_a\taf_containment_b\tjaccard_status\tcontainment_status\tani_status\taf_status";
+
+/// The rows `compare --local-method runs` should print, through the library.
+fn aiips_run_rows(
+    t: &Workspace,
+    a: &str,
+    b: &str,
+    config: &aiips::sketch::aiips::LocalConfig,
+) -> String {
+    let c = aiips::sketch::aiips::compare(&load_aiips(t, a), &load_aiips(t, b), config).unwrap();
+    let v = |x: Option<f64>| x.map_or_else(|| "-1".to_string(), |x| format!("{x:.6}"));
+    let (g, l) = (&c.global, &c.local);
+    let r = l.runs.expect("runs counters");
+    let counts = [
+        r.seeds,
+        r.seeds_absorbed,
+        r.runs_built,
+        r.stops_gap,
+        r.stops_end,
+        r.ambiguous,
+        r.runs_short,
+        r.runs_trimmed,
+        r.runs_dropped,
+        r.accepted_runs,
+        r.supports,
+        r.probes_a,
+        r.probes_b,
+        r.matched_a,
+        r.matched_b,
+        r.covered_bases_a,
+        r.covered_bases_b,
+    ]
+    .map(|x| x.to_string())
+    .join("\t");
+    format!(
+        "{METRICS}\n{a}\t{b}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}\t{:.6}\n\n{AIIPS_RUN_DIAGNOSTICS}\n{a}\t{b}\t{}\t{}\t{}\t{:.6}\t{:.6}\truns\t{counts}\t{}\t{}\testimated\testimated\t{}\t{}\n",
+        g.jaccard,
+        g.containment_a_in_b,
+        g.containment_b_in_a,
+        v(l.ani),
+        v(l.af_a),
+        v(l.af_b),
+        g.ani_containment_a_in_b,
+        g.ani_containment_b_in_a,
+        g.global_a,
+        g.global_b,
+        g.global_shared,
+        g.max_containment,
+        g.putative_ani,
+        v(c.af_containment_a),
+        v(c.af_containment_b),
+        l.ani_status.name(),
+        l.af_status.name(),
+    )
+}
+
+#[test]
+fn compare_aiips_runs_method_matches_library() {
+    use aiips::sketch::aiips::{LocalConfig, LocalMethod};
+    let t = Workspace::new();
+    let genome = random_genome(5, 30_000);
+    write_fasta(&t, "g.fa", &genome);
+    let mut mutated = genome.clone();
+    for base in mutated.iter_mut().step_by(37) {
+        *base = if *base == b'A' { b'C' } else { b'A' };
+    }
+    write_fasta(&t, "m.fa", &mutated);
+    let dense = ["--anchor-scaled", "20", "--probe-scaled", "10"];
+    aiips(&t, "g.fa", "g", &dense);
+    aiips(&t, "m.fa", "m", &dense);
+    let rows = |out: &str| out.split_once("\n\n").unwrap().1.to_owned();
+    let runs = LocalConfig {
+        method: LocalMethod::Runs,
+        ..LocalConfig::default()
+    };
+    for (flags, config) in [
+        (vec!["--local-method", "runs"], runs),
+        (
+            vec![
+                "--local-method",
+                "runs",
+                "--run-gap-factor",
+                "4.5",
+                "--run-max-gap",
+                "3000",
+            ],
+            LocalConfig {
+                run_gap_factor: 4.5,
+                run_max_gap: 3000,
+                ..runs
+            },
+        ),
+        (
+            vec![
+                "--local-method",
+                "runs",
+                "--run-band",
+                "0",
+                "--run-min-supports",
+                "40",
+                "--run-pad",
+                "0",
+            ],
+            LocalConfig {
+                run_band: 0,
+                run_min_supports: 40,
+                run_pad: Some(0),
+                ..runs
+            },
+        ),
+        (
+            vec!["--local-method", "runs", "--min-scoring-probes", "1000000"],
+            LocalConfig {
+                min_scoring_probes: 1_000_000,
+                ..runs
+            },
+        ),
+    ] {
+        let mut args = vec!["compare", "g.aiips", "m.aiips"];
+        args.extend(&flags);
+        let output = t.run(&args);
+        assert!(output.status.success(), "{flags:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            rows(&stdout),
+            aiips_run_rows(&t, "g.aiips", "m.aiips", &config),
+            "{flags:?}"
+        );
+    }
+    // Success with stdout; a containment warning may go to stderr.
+    let ok = |args: &[&str]| {
+        let output = t.run(args);
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    // Different settings give different results.
+    let default = ok(&["compare", "g.aiips", "m.aiips", "--local-method", "runs"]);
+    let padded = ok(&[
+        "compare",
+        "g.aiips",
+        "m.aiips",
+        "--local-method",
+        "runs",
+        "--run-pad",
+        "5000",
+    ]);
+    assert_ne!(default, padded);
+    // An explicit blocks method prints exactly the default output.
+    assert_eq!(
+        ok(&["compare", "g.aiips", "m.aiips"]),
+        ok(&["compare", "g.aiips", "m.aiips", "--local-method", "blocks"])
+    );
+    // Sequence inputs work too.
+    let fasta = ok(&[
+        "compare",
+        "g.fa",
+        "m.fa",
+        "-a",
+        "aiips",
+        "--local-method",
+        "runs",
+    ]);
+    assert!(
+        fasta.contains(&format!("\n{AIIPS_RUN_DIAGNOSTICS}\n")),
+        "{fasta}"
+    );
+}
+
+#[test]
+fn compare_aiips_runs_flags_are_checked() {
+    let t = Workspace::new();
+    aiips(
+        &t,
+        "good.fa",
+        "a",
+        &["--probe-k", "3", "--probe-scaled", "1"],
+    );
+    for (args, message) in [
+        (
+            vec!["--local-method", "chains"],
+            "local method must be blocks or runs",
+        ),
+        (
+            vec!["--local-method"],
+            "local method must be blocks or runs",
+        ),
+        (
+            vec!["--local-method", "runs", "--local-method", "runs"],
+            "local method may only be specified once",
+        ),
+        (
+            vec!["--local-method", "runs", "--run-gap-factor", "0"],
+            "run gap factor must be a finite number above 0",
+        ),
+        (
+            vec!["--local-method", "runs", "--run-gap-factor", "-1"],
+            "run gap factor must be",
+        ),
+        (
+            vec!["--local-method", "runs", "--run-gap-factor", "inf"],
+            "run gap factor must be",
+        ),
+        (
+            vec!["--local-method", "runs", "--run-max-gap", "0"],
+            "run max gap must be an integer from 1",
+        ),
+        (
+            vec!["--local-method", "runs", "--run-band", "-1"],
+            "run band must be an integer from 0",
+        ),
+        (
+            vec!["--local-method", "runs", "--run-min-supports", "1"],
+            "run min supports must be an integer from 2",
+        ),
+        (
+            vec!["--local-method", "runs", "--run-pad", "x"],
+            "run pad must be an integer from 0",
+        ),
+        (
+            vec!["--run-band", "50"],
+            "--run-band applies only to --local-method runs, not blocks",
+        ),
+        (
+            vec!["--local-method", "blocks", "--run-pad", "50"],
+            "--run-pad applies only to --local-method runs, not blocks",
+        ),
+        (
+            vec!["--local-method", "runs", "--min-block-span", "5"],
+            "--min-block-span applies only to --local-method blocks, not runs",
+        ),
+        (
+            vec!["--local-method", "runs", "--min-mapping-hits", "5"],
+            "--min-mapping-hits applies only to --local-method blocks, not runs",
+        ),
+    ] {
+        let mut full = vec!["compare", "a.aiips", "a.aiips"];
+        full.extend(args);
+        t.failure(&full, message);
+    }
+    // --min-scoring-probes applies to both methods.
+    t.success(&[
+        "compare",
+        "a.aiips",
+        "a.aiips",
+        "--local-method",
+        "runs",
+        "--min-scoring-probes",
+        "5",
+    ]);
+    // Run settings belong to aiips comparisons only.
+    t.sketch("good.fa", "m", &["-k", "3"]);
+    t.failure(
+        &["compare", "m.aiips", "m.aiips", "--local-method", "runs"],
+        "--local-method applies only to aiips, not minhash",
+    );
+    t.failure(
+        &["compare", "good.fa", "good.fq", "--run-band", "5"],
+        "--run-band applies only to aiips, not minhash",
+    );
+    let help = t.success(&["compare", "--help"]);
+    for flag in [
+        "--local-method",
+        "--run-gap-factor",
+        "--run-max-gap",
+        "--run-band",
+        "--run-min-supports",
+        "--run-pad",
+    ] {
+        assert!(help.contains(flag), "{flag}");
+    }
+}
