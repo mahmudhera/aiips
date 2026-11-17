@@ -46,10 +46,11 @@ pub fn summarize_with<R: Read + Send>(
     Ok(summary)
 }
 
-/// Visits each record's sequence (line breaks removed), auto-detecting
-/// FASTA/FASTQ and gzip, and returns the number of records. For callers that
-/// compute their own statistics in their single pass over each sequence.
-pub fn for_each_sequence<R: Read + Send>(
+/// Visits each record's raw sequence, auto-detecting FASTA/FASTQ and gzip,
+/// and returns the number of records. FASTA sequences keep their line breaks
+/// (`\n`, `\r`; the record's final `\r` is trimmed), sparing a copy: the
+/// caller removes them in its own single pass over each sequence.
+pub fn for_each_raw_sequence<R: Read + Send>(
     input: R,
     mut visit: impl FnMut(&[u8]),
 ) -> Result<u64, ParseError> {
@@ -58,7 +59,7 @@ pub fn for_each_sequence<R: Read + Send>(
     while let Some(record) = reader.next() {
         let record = record?;
         records += 1;
-        visit(&record.seq());
+        visit(record.raw_seq());
     }
     Ok(records)
 }

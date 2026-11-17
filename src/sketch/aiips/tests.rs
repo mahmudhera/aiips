@@ -458,3 +458,174 @@ fn every_instruction_set_gives_the_brute_force_sketch_and_summary() {
         }
     }
 }
+
+#[test]
+fn transpose8_transposes_byte_matrices() {
+    let mut rng = SplitMix64::new(51);
+    for _ in 0..1000 {
+        let rows: [u64; 8] = std::array::from_fn(|_| rng.next().unwrap());
+        let mut fast = rows;
+        transpose8(&mut fast);
+        for (j, column) in fast.iter().enumerate() {
+            for (l, row) in rows.iter().enumerate() {
+                assert_eq!(column.to_le_bytes()[l], row.to_le_bytes()[j]);
+            }
+        }
+    }
+}
+
+#[test]
+fn word_encoding_matches_the_lookup_table_for_every_byte() {
+    for byte in 0..=255u8 {
+        for position in 0..8 {
+            let mut bytes = *b"ACGTacgt";
+            bytes[position] = byte;
+            let encoded = encode_word(u64::from_le_bytes(bytes)).to_le_bytes();
+            let expected: Vec<u8> = bytes.iter().map(|&b| BASE_CODE[b as usize]).collect();
+            assert_eq!(encoded.to_vec(), expected, "byte {byte} at {position}");
+        }
+    }
+}
+
+/// Wraps `seq` into lines of the given widths (cycled), joined by `newline`.
+fn wrap(seq: &[u8], widths: &[usize], newline: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut at, mut i) = (0, 0);
+    while at < seq.len() {
+        let w = widths[i % widths.len()].min(seq.len() - at);
+        out.extend_from_slice(&seq[at..at + w]);
+        at += w;
+        if at < seq.len() {
+            out.extend_from_slice(newline);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Decodes a record as `sample_record` does (mode choice and redo), in
+/// chunks of `chunk` bytes.
+fn decode(raw: &[u8], chunk: usize) -> (Vec<u8>, bool) {
+    let newlines = raw.iter().filter(|&&b| b == b'\n').count();
+    let returns = raw.iter().filter(|&&b| b == b'\r').count();
+    let mut mode = match (newlines, returns) {
+        (0, 0) => Breaks::None,
+        (_, 0) => Breaks::Predicted,
+        _ => Breaks::Any,
+    };
+    let mut redone = false;
+    loop {
+        let mut decoder = Decoder::new(raw, mode);
+        let (mut out, mut buf) = (Vec::new(), vec![0; chunk]);
+        loop {
+            let len = decoder.fill(&mut buf);
+            if len == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..len]);
+        }
+        if mode == Breaks::Predicted && decoder.newlines != newlines {
+            mode = Breaks::Any;
+            redone = true;
+            continue;
+        }
+        return (out, redone);
+    }
+}
+
+#[test]
+fn decoding_drops_line_breaks_like_needletail() {
+    let reference = |raw: &[u8]| -> Vec<u8> {
+        raw.iter()
+            .filter(|&&b| b != b'\n' && b != b'\r')
+            .map(|&b| BASE_CODE[b as usize])
+            .collect()
+    };
+    let mut seq = random_sequence(5_000, 52);
+    seq[100] = b'N';
+    seq[2_000..2_010].make_ascii_lowercase();
+    let mut cases: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        b"\n".to_vec(),
+        b"\n\nACGT\n".to_vec(),
+        seq.clone(),
+    ];
+    for widths in [
+        vec![1],
+        vec![7],
+        vec![8],
+        vec![60],
+        vec![80],
+        vec![61, 80],
+        vec![80, 80, 3],
+        vec![5000],
+    ] {
+        cases.push(wrap(&seq, &widths, b"\n"));
+        cases.push(wrap(&seq, &widths, b"\r\n"));
+    }
+    // A line longer than the first, a lone carriage return, empty lines.
+    let mut odd = wrap(&seq, &[80], b"\n");
+    odd.insert(500, b'\n');
+    odd.insert(1_000, b'\r');
+    odd.splice(1_500..1_500, b"\n\n".iter().copied());
+    cases.push(odd);
+    // Width predicted from a short first line while a later line holds a
+    // break before the predicted position: decoding must be redone.
+    // (After "ACGTACG", the break at index 7 of "AC\nACGT\nAC" matches the
+    // predicted width but the line ends at index 2.)
+    let tricky = b"ACGTACG\nAC\nACGT\nAC".to_vec();
+    assert!(decode(&tricky, 64).1, "the misprediction must be caught");
+    cases.push(tricky);
+    for raw in &cases {
+        for chunk in [1, 7, 64, 1 << 16] {
+            let (codes, _) = decode(raw, chunk);
+            assert_eq!(
+                codes,
+                reference(raw),
+                "chunk {chunk}: {:?}",
+                String::from_utf8_lossy(&raw[..raw.len().min(40)])
+            );
+        }
+    }
+}
+
+#[test]
+fn line_wrapped_records_give_the_brute_force_sketch() {
+    // Longer than three chunks, with ambiguous bases around chunk ends.
+    let mut long = random_sequence(3 * CHUNK + 1_234, 61);
+    for i in [
+        CHUNK - 21,
+        CHUNK - 1,
+        CHUNK,
+        2 * CHUNK + 5,
+        3 * CHUNK + 1_000,
+    ] {
+        long[i] = b'N';
+    }
+    let plain: Vec<Vec<u8>> = vec![long, random_sequence(70, 62), random_sequence(9_000, 63)];
+    let refs: Vec<&[u8]> = plain.iter().map(Vec::as_slice).collect();
+    let p = params(21, 50, 15, 10);
+    let expected = brute_force(&refs, &p);
+    for (widths, newline) in [
+        (vec![60], &b"\n"[..]),
+        (vec![61, 80], b"\n"),
+        (vec![80], b"\r\n"),
+        (vec![70, 70, 9], b"\n"),
+        (vec![CHUNK + 3], b"\n"),
+    ] {
+        let wrapped: Vec<Vec<u8>> = plain.iter().map(|r| wrap(r, &widths, newline)).collect();
+        for isa in Isa::available() {
+            let mut builder = Builder::new(&p);
+            builder.isa = isa;
+            for record in &wrapped {
+                builder.add_record(record);
+            }
+            let built = builder.finish(p.clone()).unwrap();
+            assert_same_structure(&built, &expected);
+            assert_eq!(
+                built.summary.bases,
+                plain.iter().map(|r| r.len() as u64).sum::<u64>()
+            );
+        }
+    }
+}

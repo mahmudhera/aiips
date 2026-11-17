@@ -6,9 +6,11 @@ Usage:
       [--variant LABEL=ARGS ...] [--skani-args ARGS] [--repeat N]
 
 TRUTH_TSV comes from scripts/simulate.py. Each tool compares the two FASTA
-files directly (sketching included) on one thread; wall time and peak resident
-memory come from /usr/bin/time. A missing estimate (e.g. skani screening a
-pair out) is recorded as NA. Standard library only.
+files directly (sketching included) on one thread. Wall time is measured
+around the process, user and system CPU time come from getrusage, and peak
+resident memory from /usr/bin/time; with --repeat the fastest run is kept.
+--cpu pins every run to one core (taskset). A missing estimate (e.g. skani
+screening a pair out) is recorded as NA. Standard library only.
 
 --variant adds an aiips run with extra `compare` arguments, e.g.
   --variant gap0="--max-gap 0"; the default variant has no extra arguments.
@@ -17,24 +19,33 @@ pair out) is recorded as NA. Standard library only.
 import argparse
 import csv
 import os
+import resource
 import shlex
 import statistics
 import subprocess
 import tempfile
+import time
+
+PIN = []
 
 
 def timed(command):
-    """Runs command; returns (stdout, wall seconds, max RSS in KiB)."""
+    """Runs command; returns (stdout, (wall, user, sys) seconds, max RSS KiB)."""
     with tempfile.NamedTemporaryFile("r", suffix=".time") as t:
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        start = time.perf_counter()
         result = subprocess.run(
-            ["/usr/bin/time", "-f", "%e %M", "-o", t.name] + command,
+            PIN + ["/usr/bin/time", "-f", "%M", "-o", t.name] + command,
             capture_output=True,
             text=True,
         )
+        wall = time.perf_counter() - start
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
         if result.returncode != 0:
             raise RuntimeError(f"{shlex.join(command)} failed: {result.stderr}")
-        wall, rss = t.read().split()[-2:]
-    return result.stdout, float(wall), int(rss)
+        rss = int(t.read().split()[-1])
+    cpu = (wall, after.ru_utime - before.ru_utime, after.ru_stime - before.ru_stime)
+    return result.stdout, cpu, rss
 
 
 def run_skani(skani, extra, a, b):
@@ -69,13 +80,20 @@ def main():
     parser.add_argument("--no-skani", action="store_true")
     parser.add_argument("--repeat", type=int, default=1,
                         help="runs per tool and pair; the fastest is kept")
+    parser.add_argument("--cpu", type=int, help="pin runs to this core")
+    parser.add_argument("--other-aiips", action="append", default=[],
+                        help="LABEL=PATH: another aiips binary, default options")
     args = parser.parse_args()
+    if args.cpu is not None:
+        PIN.extend(["taskset", "-c", str(args.cpu)])
     variants = [("aiips", [])] + [
         (f"aiips:{label}", shlex.split(extra))
         for label, extra in (v.split("=", 1) for v in args.variant)
     ]
     tools = [(label, lambda a, b, extra=extra: run_aiips(args.aiips, extra, a, b))
              for label, extra in variants]
+    tools += [(label, lambda a, b, path=path: run_aiips(path, [], a, b))
+              for label, path in (o.split("=", 1) for o in args.other_aiips)]
     if not args.no_skani:
         skani_extra = shlex.split(args.skani_args)
         tools.append(("skani", lambda a, b: run_skani(args.skani, skani_extra, a, b)))
@@ -85,30 +103,30 @@ def main():
         truth = list(csv.DictReader(f, delimiter="\t"))
     rows = []
     with open(args.out, "w") as out:
-        out.write("scenario\tcategory\ttool\ttrue_ani\ttrue_af_a\ttrue_af_b\tani\taf_a\taf_b\twall_s\tmax_rss_kb\n")
+        out.write("scenario\tcategory\ttool\ttrue_ani\ttrue_af_a\ttrue_af_b\tani\taf_a\taf_b\twall_s\tuser_s\tsys_s\tmax_rss_kb\n")
         for t in truth:
             for label, run in tools:
                 runs = [run(t["a"], t["b"]) for _ in range(args.repeat)]
                 ani, af_a, af_b, _, _ = runs[0]
-                wall = min(r[3] for r in runs)
+                wall, user, sys_ = min(r[3] for r in runs)
                 rss = min(r[4] for r in runs)
                 row = dict(scenario=t["scenario"], category=t["category"], tool=label,
                            true_ani=float(t["ani"]), true_af_a=float(t["af_a"]),
                            true_af_b=float(t["af_b"]), ani=ani, af_a=af_a, af_b=af_b,
-                           wall=wall, rss=rss)
+                           wall=wall, user=user, sys=sys_, rss=rss)
                 rows.append(row)
                 out.write(f"{t['scenario']}\t{t['category']}\t{label}\t{t['ani']}\t{t['af_a']}\t{t['af_b']}\t"
-                          f"{fmt(ani)}\t{fmt(af_a)}\t{fmt(af_b)}\t{wall:.2f}\t{rss}\n")
+                          f"{fmt(ani)}\t{fmt(af_a)}\t{fmt(af_b)}\t{wall:.4f}\t{user:.4f}\t{sys_:.4f}\t{rss}\n")
                 out.flush()
                 print(f"{t['scenario']:22s} {label:14s} ani {fmt(ani, 4)} (true {float(t['ani']):.4f})  "
                       f"af {fmt(af_a, 3)}/{fmt(af_b, 3)} (true {float(t['af_a']):.3f}/{float(t['af_b']):.3f})  "
-                      f"{wall:.2f}s {rss / 1024:.0f}MiB", flush=True)
+                      f"{wall:.3f}s (user {user:.3f} sys {sys_:.3f}) {rss / 1024:.0f}MiB", flush=True)
     summarize(rows, [label for label, _ in tools])
 
 
 def summarize(rows, tools):
     """Mean/max absolute errors in percentage points, per category and tool."""
-    print("\ncategory  tool            n  ani_mae  ani_max  ani_bias  af_mae   af_max   missing  wall_s  rss_MiB")
+    print("\ncategory  tool            n  ani_mae  ani_max  ani_bias  af_mae   af_max   missing  wall_s  user_s  sys_s  rss_MiB")
     for category in sorted({r["category"] for r in rows}) + ["ALL"]:
         for tool in tools:
             sel = [r for r in rows if r["tool"] == tool and category in ("ALL", r["category"])]
@@ -119,7 +137,8 @@ def summarize(rows, tools):
             print(f"{category:9s} {tool:14s} {len(sel):3d}  {mean([abs(e) for e in ani_err]):7.3f}  "
                   f"{max((abs(e) for e in ani_err), default=float('nan')):7.3f}  {mean(ani_err):8.3f}  "
                   f"{mean(af_err):7.2f}  {max(af_err, default=float('nan')):7.2f}  {len(sel) - len(have):7d}  "
-                  f"{mean([r['wall'] for r in sel]):6.2f}  {mean([r['rss'] / 1024 for r in sel]):7.1f}")
+                  f"{mean([r['wall'] for r in sel]):6.3f}  {mean([r['user'] for r in sel]):6.3f}  "
+                  f"{mean([r['sys'] for r in sel]):5.3f}  {mean([r['rss'] / 1024 for r in sel]):7.1f}")
 
 
 if __name__ == "__main__":

@@ -20,12 +20,13 @@
 //! Comparison: see [`estimate`].
 
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Read;
 use std::num::NonZeroUsize;
 
 use super::minhash::BuildError;
 use super::{invalid, parse_u64, Fields, ParseError};
-use crate::fastx::{for_each_sequence, Summary};
+use crate::fastx::{for_each_raw_sequence, Summary};
 use crate::hash::{fmix64, SplitMix64};
 use crate::kmer::MAX_PACKED_K;
 
@@ -215,7 +216,7 @@ impl AiipsSketch {
     pub fn build<R: Read + Send>(input: R, params: AiipsParams) -> Result<Self, BuildError> {
         params.check_buildable()?;
         let mut builder = Builder::new(&params);
-        for_each_sequence(input, |sequence| builder.add_record(sequence))
+        for_each_raw_sequence(input, |sequence| builder.add_record(sequence))
             .map_err(BuildError::Input)?;
         builder.finish(params).map_err(BuildError::Unsupported)
     }
@@ -510,20 +511,37 @@ struct Builder {
     record_anchors: Vec<Sampled>,
     record_probes: Vec<Sampled>,
     lanes: [LaneOutput; LANES],
-    block: Vec<u8>,
+    /// The chunk being sampled, after the codes warming it up.
+    codes: Vec<u8>,
+    block: Box<HitBlock>,
     isa: Isa,
     summary: Summary,
     error: Option<String>,
 }
 
+/// Per-record buffers, kept by the thread between sketches: they grow to the
+/// longest record, and reusing them spares the second sketch of a comparison
+/// faulting in fresh memory.
+#[derive(Default)]
+struct Scratch {
+    record_anchors: Vec<Sampled>,
+    record_probes: Vec<Sampled>,
+    lanes: [LaneOutput; LANES],
+    codes: Vec<u8>,
+    block: Box<HitBlock>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::default();
+}
+
 /// Records are scanned as this many segments side by side, one per vector
 /// lane: the rolling codes, hashes and threshold tests of all segments
-/// advance together, so the compiler can keep them in vector registers.
+/// advance together in vector registers.
 const LANES: usize = 8;
-/// Bases per lane transposed at a time (`BLOCK * LANES` bytes of scratch).
-const BLOCK: usize = 2048;
 /// Code for positions outside a lane: breaks k-mers like N but is not a base.
 const PAD: u8 = 5;
+const ONES: u64 = 0x0101_0101_0101_0101;
 
 /// What one segment sampled, in position order.
 #[derive(Default)]
@@ -618,55 +636,250 @@ impl Isa {
     }
 }
 
-impl Sampler {
-    /// Samples one record: it is cut into `LANES` segments of `seg` bases,
-    /// lane l covering `[l·seg, (l+1)·seg)`. Each lane first warms up on the
-    /// k1 − 1 bases before its segment (outside the record: `PAD`), so it
-    /// emits exactly the k-mers ending in its segment that a sequential scan
-    /// would. Lane outputs are in position order; concatenated they are the
-    /// record's.
+/// 0x80 in each byte of `word` equal to `byte`, 0 elsewhere (exact: no
+/// borrow crosses bytes).
+#[inline(always)]
+fn bytes_equal(word: u64, byte: u8) -> u64 {
+    let low = 0x7f * ONES;
+    let z = word ^ (byte as u64 * ONES);
+    !(((z & low) + low) | z | low)
+}
+
+/// [`BASE_CODE`] of eight bytes at once. A, C, G and T (either case) have
+/// bits 1-2 equal to 0, 1, 3 and 2; one Gray-code step maps them to 0-3.
+#[inline(always)]
+fn encode_word(word: u64) -> u64 {
+    let lower = word | (0x20 * ONES);
+    let valid = (bytes_equal(lower, b'a')
+        | bytes_equal(lower, b'c')
+        | bytes_equal(lower, b'g')
+        | bytes_equal(lower, b't'))
+        >> 7;
+    let e = (word >> 1) & (3 * ONES);
+    let code = e ^ ((e >> 1) & ONES);
+    (code & (valid * 0xff)) | ((valid ^ ONES) << 2)
+}
+
+/// Encodes `src` into `dst` (equal lengths), eight bytes per step.
+#[inline(always)]
+fn encode_into(src: &[u8], dst: &mut [u8]) {
+    let (words, tail) = src.as_chunks::<8>();
+    let (slots, tail_slots) = dst.as_chunks_mut::<8>();
+    for (word, slot) in words.iter().zip(slots) {
+        *slot = encode_word(u64::from_le_bytes(*word)).to_le_bytes();
+    }
+    for (&byte, slot) in tail.iter().zip(tail_slots) {
+        *slot = BASE_CODE[byte as usize];
+    }
+}
+
+/// How a record's line breaks are removed while decoding it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Breaks {
+    /// The record has none.
+    None,
+    /// Only `\n`: lines are cut where the first line's width predicts,
+    /// unchecked; the caller compares [`Decoder::newlines`] with the record's
+    /// count and decodes again with `Any` if they differ.
+    Predicted,
+    /// `\n` and `\r` anywhere, found by search.
+    Any,
+}
+
+/// Streams a record's raw sequence as base codes ([`BASE_CODE`]), dropping
+/// the line breaks a FASTA record may hold exactly as needletail's `seq`
+/// does.
+struct Decoder<'a> {
+    rest: &'a [u8],
+    mode: Breaks,
+    /// Bytes left in the current line.
+    line: usize,
+    width: Option<usize>,
+    /// Line breaks consumed as separators.
+    newlines: usize,
+}
+
+impl<'a> Decoder<'a> {
+    fn new(raw: &'a [u8], mode: Breaks) -> Self {
+        Self {
+            rest: raw,
+            mode,
+            line: 0,
+            width: None,
+            newlines: 0,
+        }
+    }
+
+    /// Writes the next codes into `dst`; returns how many (0 at the end).
     #[inline(always)]
-    fn scan_lanes(
+    fn fill(&mut self, dst: &mut [u8]) -> usize {
+        let mut written = 0;
+        while written < dst.len() && !self.rest.is_empty() {
+            if self.line == 0 {
+                match self.mode {
+                    Breaks::None => self.line = self.rest.len(),
+                    Breaks::Predicted => {
+                        if self.rest[0] == b'\n' {
+                            self.rest = &self.rest[1..];
+                            self.newlines += 1;
+                            continue;
+                        }
+                        self.line = match self.width {
+                            Some(w) if self.rest.len() > w && self.rest[w] == b'\n' => w,
+                            _ => {
+                                let found = self
+                                    .rest
+                                    .iter()
+                                    .position(|&b| b == b'\n')
+                                    .unwrap_or(self.rest.len());
+                                self.width.get_or_insert(found);
+                                found
+                            }
+                        };
+                    }
+                    Breaks::Any => {
+                        if matches!(self.rest[0], b'\n' | b'\r') {
+                            self.rest = &self.rest[1..];
+                            continue;
+                        }
+                        self.line = self
+                            .rest
+                            .iter()
+                            .position(|&b| b == b'\n' || b == b'\r')
+                            .unwrap_or(self.rest.len());
+                    }
+                }
+            }
+            let take = self.line.min(dst.len() - written);
+            encode_into(&self.rest[..take], &mut dst[written..written + take]);
+            written += take;
+            self.rest = &self.rest[take..];
+            self.line -= take;
+            if self.line == 0 && self.mode == Breaks::Predicted && !self.rest.is_empty() {
+                // The separator found or predicted: a '\n'.
+                self.rest = &self.rest[1..];
+                self.newlines += 1;
+            }
+        }
+        written
+    }
+}
+
+/// Transposes an 8x8 byte matrix held as rows: afterwards byte l of `x[j]`
+/// is what byte j of `x[l]` was.
+#[inline(always)]
+fn transpose8(x: &mut [u64; 8]) {
+    for l in 0..4 {
+        let t = ((x[l] >> 32) ^ x[l + 4]) & 0x0000_0000_ffff_ffff;
+        x[l] ^= t << 32;
+        x[l + 4] ^= t;
+    }
+    for l in [0, 1, 4, 5] {
+        let t = ((x[l] >> 16) ^ x[l + 2]) & 0x0000_ffff_0000_ffff;
+        x[l] ^= t << 16;
+        x[l + 2] ^= t;
+    }
+    for l in [0, 2, 4, 6] {
+        let t = ((x[l] >> 8) ^ x[l + 1]) & 0x00ff_00ff_00ff_00ff;
+        x[l] ^= t << 8;
+        x[l + 1] ^= t;
+    }
+}
+
+/// Steps buffered before their samples are appended to the lane outputs.
+const HIT_BLOCK: usize = 256;
+
+/// Scan steps at which some lane sampled, with the lane state needed to
+/// emit the samples: bit l of `anchors` (`probes`) is set when lane l's
+/// k1-mer (k2-mer) ending at the step is sampled, of `reverse1`
+/// (`reverse2`) when its canonical form is the reverse complement.
+struct HitBlock {
+    len: usize,
+    offset: [u32; HIT_BLOCK],
+    anchors: [u8; HIT_BLOCK],
+    probes: [u8; HIT_BLOCK],
+    reverse1: [u8; HIT_BLOCK],
+    reverse2: [u8; HIT_BLOCK],
+    h1: [[u64; LANES]; HIT_BLOCK],
+    h2: [[u64; LANES]; HIT_BLOCK],
+}
+
+impl Default for HitBlock {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            offset: [0; HIT_BLOCK],
+            anchors: [0; HIT_BLOCK],
+            probes: [0; HIT_BLOCK],
+            reverse1: [0; HIT_BLOCK],
+            reverse2: [0; HIT_BLOCK],
+            h1: [[0; LANES]; HIT_BLOCK],
+            h2: [[0; LANES]; HIT_BLOCK],
+        }
+    }
+}
+
+impl Sampler {
+    /// Samples one chunk of a record. `buf` holds the k1 − 1 codes before
+    /// the chunk (`PAD` at the record start) and then the chunk, whose first
+    /// base is at record position `base`. The chunk is cut into `LANES`
+    /// segments of `seg` bases; each lane first warms up on the k1 − 1 codes
+    /// before its segment, so it samples exactly the k-mers ending in its
+    /// segment that a sequential scan would. Lanes read eight codes at a
+    /// time, transposed so each step holds one code per lane. A step whose
+    /// hashes all exceed both thresholds (about nine in ten) costs only the
+    /// test; the others are buffered in `block` and emitted in bulk, so the
+    /// loop's state stays in registers. Lane outputs are in position order;
+    /// concatenated they are the chunk's.
+    #[inline(always)]
+    fn scan_chunk(
         &self,
-        sequence: &[u8],
-        block: &mut [u8],
+        buf: &[u8],
+        base: usize,
+        block: &mut HitBlock,
         out: &mut [LaneOutput; LANES],
-    ) -> Counts {
-        let n = sequence.len();
-        let seg = n.div_ceil(LANES);
+    ) {
         let warm = self.k1 - 1;
+        let n = buf.len() - warm;
+        let seg = n.div_ceil(LANES);
         let steps = seg + warm;
+        // Lane l reads buf[l·seg..ends[l]]: its warm-up, then its segment.
+        let ends: [usize; LANES] = std::array::from_fn(|l| warm + ((l + 1) * seg).min(n));
+        let codes = buf;
         let (k1, k2) = (self.k1 as u64, self.k2 as u64);
         let mut f1 = [0u64; LANES];
         let mut r1 = [0u64; LANES];
         let mut f2 = [0u64; LANES];
         let mut r2 = [0u64; LANES];
         let mut run = [0u64; LANES];
-        let mut invalid = [0u64; LANES];
-        let mut windows = [0u64; LANES];
-        let mut first = 0;
-        while first < steps {
-            let len = BLOCK.min(steps - first);
-            // Transpose: block[j·LANES + l] is lane l's code at step first + j.
+        block.len = 0;
+        let mut group = 0;
+        while group < steps {
+            let mut rows = [0u64; LANES];
             for l in 0..LANES {
-                let end = ((l + 1) * seg).min(n);
-                for j in 0..len {
-                    let pos = (l * seg + first + j).wrapping_sub(warm);
-                    block[j * LANES + l] = if pos < end {
-                        BASE_CODE[sequence[pos] as usize]
-                    } else {
-                        PAD
-                    };
-                }
+                let start = l * seg + group;
+                rows[l] = if start + 8 <= ends[l] {
+                    u64::from_le_bytes(codes[start..start + 8].try_into().unwrap())
+                } else {
+                    let mut bytes = [PAD; 8];
+                    for (j, byte) in bytes.iter_mut().enumerate() {
+                        if start + j < ends[l] {
+                            *byte = codes[start + j];
+                        }
+                    }
+                    u64::from_le_bytes(bytes)
+                };
             }
-            for j in 0..len {
-                let step = first + j;
-                let codes: &[u8; LANES] = block[j * LANES..(j + 1) * LANES].try_into().unwrap();
+            transpose8(&mut rows);
+            // Steps past the last are all PAD: they sample nothing.
+            for (j, row) in rows.iter().enumerate() {
+                let step = group + j;
+                let lane_codes = row.to_le_bytes();
                 let mut h1 = [0u64; LANES];
                 let mut h2 = [0u64; LANES];
-                let mut hit = false;
+                let mut any = false;
                 for l in 0..LANES {
-                    let code = codes[l] as u64;
+                    let code = lane_codes[l] as u64;
                     let c = code & 3;
                     f1[l] = ((f1[l] << 2) | c) & self.m1;
                     r1[l] = (r1[l] >> 2) | ((3 - c) << self.s1);
@@ -677,77 +890,172 @@ impl Sampler {
                     let c2 = if f2[l] < r2[l] { f2[l] } else { r2[l] };
                     h1[l] = fmix64(c1 ^ self.seed1);
                     h2[l] = fmix64(c2 ^ self.seed2);
-                    hit |= (h1[l] <= self.max1) | (h2[l] <= self.max2);
+                    any |= (h1[l] <= self.max1) | (h2[l] <= self.max2);
                 }
-                if step < warm {
+                if !any || step < warm {
                     continue;
                 }
+                let (mut anchors, mut probes, mut reverse1, mut reverse2) = (0u8, 0u8, 0u8, 0u8);
                 for l in 0..LANES {
-                    invalid[l] += (codes[l] == 4) as u64;
-                    windows[l] += (run[l] >= k2) as u64;
+                    anchors |= (((run[l] >= k1) & (h1[l] <= self.max1)) as u8) << l;
+                    probes |= (((run[l] >= k2) & (h2[l] <= self.max2)) as u8) << l;
+                    reverse1 |= ((r1[l] < f1[l]) as u8) << l;
+                    reverse2 |= ((r2[l] < f2[l]) as u8) << l;
                 }
-                if hit {
-                    for l in 0..LANES {
-                        let pos = l * seg + step - warm;
-                        if run[l] >= k2 && h2[l] <= self.max2 {
-                            out[l].probes.push(Sampled {
-                                pos: (pos + 1 - self.k2) as u32,
-                                reverse: r2[l] < f2[l],
-                                hash: h2[l],
-                            });
-                        }
-                        if run[l] >= k1 && h1[l] <= self.max1 {
-                            out[l].anchors.push(Sampled {
-                                pos: (pos + 1 - self.k1) as u32,
-                                reverse: r1[l] < f1[l],
-                                hash: h1[l],
-                            });
-                        }
-                    }
+                if anchors | probes == 0 {
+                    continue;
+                }
+                let i = block.len;
+                block.offset[i] = (step - warm) as u32;
+                block.anchors[i] = anchors;
+                block.probes[i] = probes;
+                block.reverse1[i] = reverse1;
+                block.reverse2[i] = reverse2;
+                block.h1[i] = h1;
+                block.h2[i] = h2;
+                block.len += 1;
+                if block.len == HIT_BLOCK {
+                    self.emit(block, base, seg, out);
                 }
             }
-            first += len;
+            group += 8;
         }
-        Counts {
-            invalid: invalid.iter().sum(),
-            windows: windows.iter().sum(),
+        self.emit(block, base, seg, out);
+    }
+
+    /// Appends the buffered samples to the lane outputs and empties `block`.
+    #[cold]
+    #[inline(never)]
+    fn emit(&self, block: &mut HitBlock, base: usize, seg: usize, out: &mut [LaneOutput; LANES]) {
+        let (k1, k2) = (self.k1 as u32, self.k2 as u32);
+        for i in 0..block.len {
+            for (l, lane) in out.iter_mut().enumerate() {
+                let end = (base + l * seg) as u32 + block.offset[i] + 1;
+                if block.probes[i] >> l & 1 == 1 {
+                    lane.probes.push(Sampled {
+                        pos: end - k2,
+                        reverse: block.reverse2[i] >> l & 1 == 1,
+                        hash: block.h2[i][l],
+                    });
+                }
+                if block.anchors[i] >> l & 1 == 1 {
+                    lane.anchors.push(Sampled {
+                        pos: end - k1,
+                        reverse: block.reverse1[i] >> l & 1 == 1,
+                        hash: block.h1[i][l],
+                    });
+                }
+            }
         }
+        block.len = 0;
+    }
+}
+
+/// Adds a chunk's summary counts: bases other than A/C/G/T, and windows of
+/// `k` valid bases. `run` carries the valid bases ending the previous chunk.
+/// Without ambiguous bases (the common case) the windows follow from the
+/// length.
+#[inline(always)]
+fn chunk_counts(codes: &[u8], k: usize, run: &mut usize, counts: &mut Counts) {
+    let invalid = codes.iter().filter(|&&c| c == 4).count();
+    counts.invalid += invalid as u64;
+    if invalid == 0 {
+        let skipped = (k - 1).saturating_sub(*run).min(codes.len());
+        counts.windows += (codes.len() - skipped) as u64;
+        *run += codes.len();
+        return;
+    }
+    for &code in codes {
+        *run = if code > 3 { 0 } else { *run + 1 };
+        counts.windows += (*run >= k) as u64;
+    }
+}
+
+/// Bases decoded per chunk.
+const CHUNK: usize = 1 << 16;
+
+/// Per-record working state of the sampler.
+struct RecordBuffers<'b> {
+    buf: &'b mut Vec<u8>,
+    block: &'b mut HitBlock,
+    lanes: &'b mut [LaneOutput; LANES],
+    anchors: &'b mut Vec<Sampled>,
+    probes: &'b mut Vec<Sampled>,
+}
+
+/// Decodes and samples one record chunk by chunk, appending its anchors and
+/// candidate probes in position order. Returns the record length and its
+/// counts, or only the length when it is too long for 32-bit positions.
+#[inline(always)]
+fn sample_record(s: &Sampler, raw: &[u8], b: &mut RecordBuffers) -> (usize, Option<Counts>) {
+    let (newlines, returns) = raw.iter().fold((0usize, 0usize), |(n, r), &byte| {
+        (n + (byte == b'\n') as usize, r + (byte == b'\r') as usize)
+    });
+    let length = raw.len() - newlines - returns;
+    if length > u32::MAX as usize {
+        return (length, None);
+    }
+    let mut mode = match (newlines, returns) {
+        (0, 0) => Breaks::None,
+        (_, 0) => Breaks::Predicted,
+        _ => Breaks::Any,
+    };
+    let warm = s.k1 - 1;
+    loop {
+        b.anchors.clear();
+        b.probes.clear();
+        b.buf.clear();
+        b.buf.resize(warm + CHUNK, PAD);
+        let mut decoder = Decoder::new(raw, mode);
+        let (mut base, mut run, mut counts) = (0, 0, Counts::default());
+        loop {
+            let len = decoder.fill(&mut b.buf[warm..]);
+            if len == 0 {
+                break;
+            }
+            for lane in b.lanes.iter_mut() {
+                lane.anchors.clear();
+                lane.probes.clear();
+            }
+            s.scan_chunk(&b.buf[..warm + len], base, b.block, b.lanes);
+            for lane in b.lanes.iter() {
+                b.anchors.extend_from_slice(&lane.anchors);
+                b.probes.extend_from_slice(&lane.probes);
+            }
+            chunk_counts(&b.buf[warm..warm + len], s.k2, &mut run, &mut counts);
+            base += len;
+            // The chunk's last k1 − 1 codes warm the next chunk's lanes.
+            b.buf.copy_within(len..len + warm, 0);
+        }
+        if mode == Breaks::Predicted && decoder.newlines != newlines {
+            // A predicted line held a line break: decode by search.
+            mode = Breaks::Any;
+            continue;
+        }
+        debug_assert_eq!(base, length);
+        return (length, Some(counts));
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512dq,avx512vl,avx512bw")]
-fn scan_avx512(
-    s: &Sampler,
-    sequence: &[u8],
-    block: &mut [u8],
-    out: &mut [LaneOutput; LANES],
-) -> Counts {
-    s.scan_lanes(sequence, block, out)
+fn sample_avx512(s: &Sampler, raw: &[u8], b: &mut RecordBuffers) -> (usize, Option<Counts>) {
+    sample_record(s, raw, b)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-fn scan_avx2(
-    s: &Sampler,
-    sequence: &[u8],
-    block: &mut [u8],
-    out: &mut [LaneOutput; LANES],
-) -> Counts {
-    s.scan_lanes(sequence, block, out)
+fn sample_avx2(s: &Sampler, raw: &[u8], b: &mut RecordBuffers) -> (usize, Option<Counts>) {
+    sample_record(s, raw, b)
 }
 
-fn scan_baseline(
-    s: &Sampler,
-    sequence: &[u8],
-    block: &mut [u8],
-    out: &mut [LaneOutput; LANES],
-) -> Counts {
-    s.scan_lanes(sequence, block, out)
+fn sample_baseline(s: &Sampler, raw: &[u8], b: &mut RecordBuffers) -> (usize, Option<Counts>) {
+    sample_record(s, raw, b)
 }
 
 impl Builder {
     fn new(params: &AiipsParams) -> Self {
+        let scratch = SCRATCH.with(|s| s.take());
         let (seed1, seed2) = params.hash_seeds();
         let (k1, k2) = (params.anchor_k.get(), params.probe_k.get());
         Self {
@@ -768,57 +1076,51 @@ impl Builder {
             anchor_contig: Vec::new(),
             island_start: Vec::new(),
             probes: Vec::new(),
-            record_anchors: Vec::new(),
-            record_probes: Vec::new(),
-            lanes: Default::default(),
-            block: vec![PAD; BLOCK * LANES],
+            record_anchors: scratch.record_anchors,
+            record_probes: scratch.record_probes,
+            lanes: scratch.lanes,
+            codes: scratch.codes,
+            block: scratch.block,
             isa: Isa::detect(),
             summary: Summary::default(),
             error: None,
         }
     }
 
-    fn add_record(&mut self, sequence: &[u8]) {
+    /// Adds one record given as raw sequence (FASTA line breaks allowed).
+    fn add_record(&mut self, raw: &[u8]) {
         self.summary.records += 1;
-        self.summary.bases += sequence.len() as u64;
         if self.error.is_some() {
             return;
         }
-        let Ok(length) = u32::try_from(sequence.len()) else {
+        let mut buffers = RecordBuffers {
+            buf: &mut self.codes,
+            block: &mut self.block,
+            lanes: &mut self.lanes,
+            anchors: &mut self.record_anchors,
+            probes: &mut self.record_probes,
+        };
+        let sampler = &self.sampler;
+        let (length, counts) = match self.isa {
+            // SAFETY: these variants are selected only when `Isa::detect`
+            // found the instruction sets they are compiled for.
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512 => unsafe { sample_avx512(sampler, raw, &mut buffers) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx2 => unsafe { sample_avx2(sampler, raw, &mut buffers) },
+            _ => sample_baseline(sampler, raw, &mut buffers),
+        };
+        self.summary.bases += length as u64;
+        let Some(counts) = counts else {
             self.error = Some(format!(
                 "records longer than {} bases are not supported",
                 u32::MAX
             ));
             return;
         };
-        self.scan(sequence);
-        self.store(length);
-    }
-
-    /// Collects the record's anchors and candidate probes in position order.
-    fn scan(&mut self, sequence: &[u8]) {
-        for out in &mut self.lanes {
-            out.anchors.clear();
-            out.probes.clear();
-        }
-        let (sampler, block, lanes) = (&self.sampler, &mut self.block[..], &mut self.lanes);
-        let counts = match self.isa {
-            // SAFETY: these variants are selected only when `Isa::detect`
-            // found the instruction sets they are compiled for.
-            #[cfg(target_arch = "x86_64")]
-            Isa::Avx512 => unsafe { scan_avx512(sampler, sequence, block, lanes) },
-            #[cfg(target_arch = "x86_64")]
-            Isa::Avx2 => unsafe { scan_avx2(sampler, sequence, block, lanes) },
-            _ => scan_baseline(sampler, sequence, block, lanes),
-        };
         self.summary.non_acgt_bases += counts.invalid;
         self.summary.kmers += counts.windows;
-        self.record_anchors.clear();
-        self.record_probes.clear();
-        for out in &self.lanes {
-            self.record_anchors.extend_from_slice(&out.anchors);
-            self.record_probes.extend_from_slice(&out.probes);
-        }
+        self.store(length as u32);
     }
 
     /// Drops probes overlapping an anchor, promotes the leading probe, and
@@ -876,6 +1178,15 @@ impl Builder {
 
     fn finish(mut self, params: AiipsParams) -> Result<AiipsSketch, String> {
         let summary = self.summary;
+        SCRATCH.with(|s| {
+            s.replace(Scratch {
+                record_anchors: std::mem::take(&mut self.record_anchors),
+                record_probes: std::mem::take(&mut self.record_probes),
+                lanes: std::mem::take(&mut self.lanes),
+                codes: std::mem::take(&mut self.codes),
+                block: std::mem::take(&mut self.block),
+            })
+        });
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -1218,16 +1529,6 @@ struct Walks {
     walks: Vec<(u64, [usize; 4])>,
 }
 
-fn shared_probes(a: &[Sampled], b: &[Sampled]) -> u32 {
-    let mut shared = 0;
-    for x in a {
-        if b.iter().any(|y| y.hash == x.hash) {
-            shared += 1;
-        }
-    }
-    shared
-}
-
 /// The confirmed end of a walk in one genome: the furthest base, in walk
 /// direction, of a shared k-mer.
 #[derive(Clone, Copy, Debug)]
@@ -1365,23 +1666,32 @@ fn exclude_overlapping(
         this.params.anchor_k.get() as i64,
         this.params.probe_k.get() as i64,
     );
-    let anchors = bounding_anchors(other, other_cursor);
-    if anchors == [None, None] {
+    // The other genome's bounding anchors as offset ranges in this genome's
+    // walk frame; overlap is rare, so it is tested first.
+    let spans = bounding_anchors(other, other_cursor).map(|t| {
+        t.map(|t| {
+            let start = other_cursor.rel(other, t) - shift;
+            (start - k2, start + k1)
+        })
+    });
+    if spans == [None, None] {
         return;
     }
     for probe in this_cursor.probes.0..this_cursor.probes.1 {
+        let start = probe_rel(this, this_cursor, probe);
+        // Overlap: start < anchor + k1 and anchor < start + k2.
+        if !spans
+            .iter()
+            .flatten()
+            .any(|&(lo, hi)| lo < start && start < hi)
+        {
+            continue;
+        }
         let hash = this.probes[probe as usize].hash;
         if other_probes.iter().any(|q| q.hash == hash) || excluded.contains(&probe) {
             continue;
         }
-        let start = probe_rel(this, this_cursor, probe);
-        let overlaps = anchors.iter().flatten().any(|&t| {
-            let anchor = other_cursor.rel(other, t) - shift;
-            start < anchor + k1 && anchor < start + k2
-        });
-        if overlaps {
-            excluded.push(probe);
-        }
+        excluded.push(probe);
     }
 }
 
@@ -1420,12 +1730,7 @@ impl<'s> Comparer<'s> {
     /// end together or at the same k-mer). An island is judged when it is
     /// completed, from all the shared probes it accumulated; when both
     /// genomes complete an island at once, either passing suffices.
-    fn walk(
-        &self,
-        seed: &Seed,
-        steps: &mut Vec<Step>,
-        consumed: &mut HashSet<(u32, u32, bool, bool)>,
-    ) {
+    fn walk(&self, seed: &Seed, steps: &mut Vec<Step>, consumed: &mut Consumed) {
         let (a, b) = (self.a, self.b);
         let k2 = a.params.probe_k.get() as u32;
         let mut ca = Self::cursor(a, seed.a, seed.a_forward);
@@ -1451,35 +1756,29 @@ impl<'s> Comparer<'s> {
             // genome's island there.
             let (mut ra, mut rb) = (ca, cb);
             if ca.next.is_none() {
-                rb.clip(b, ca.end_rel(a), k2);
+                rb.clip(b, ca.end_rel(a) + shift, k2);
             }
             if cb.next.is_none() {
-                ra.clip(a, cb.end_rel(b), k2);
+                ra.clip(a, cb.end_rel(b) - shift, k2);
             }
             let pa = &a.probes[ra.probes.0 as usize..ra.probes.1 as usize];
             let pb = &b.probes[rb.probes.0 as usize..rb.probes.1 as usize];
-            let shared = shared_probes(pa, pb);
-            sa += shared;
-            sb += shared;
-            if shared > 0 {
-                for x in pa {
-                    if let Some(y) = pb.iter().find(|y| y.hash == x.hash) {
-                        hit_a.extend(x.pos, k2);
-                        hit_b.extend(y.pos, k2);
-                    }
+            let mut shared = 0;
+            for (i, x) in pa.iter().enumerate() {
+                if let Some(j) = pb.iter().position(|y| y.hash == x.hash) {
+                    shared += 1;
+                    hit_a.extend(x.pos, k2);
+                    hit_b.extend(pb[j].pos, k2);
+                    // Indels shift B's walk offsets against A's between
+                    // re-anchorings; the last shared probe measures it.
+                    shift = probe_rel(b, &rb, rb.probes.0 + j as u32)
+                        - probe_rel(a, &ra, ra.probes.0 + i as u32);
                 }
             }
+            sa += shared;
+            sb += shared;
             let (mut na_probes, mut nb_probes) = (pa.len() as u32, pb.len() as u32);
             if self.symmetric {
-                if shared > 0 {
-                    // Re-estimate the offset from the last shared probe.
-                    for (i, x) in pa.iter().enumerate() {
-                        if let Some(j) = pb.iter().position(|y| y.hash == x.hash) {
-                            shift = probe_rel(b, &rb, rb.probes.0 + j as u32)
-                                - probe_rel(a, &ra, ra.probes.0 + i as u32);
-                        }
-                    }
-                }
                 exclude_overlapping(a, &ra, b, &rb, pb, shift, &mut excluded_a);
                 exclude_overlapping(b, &rb, a, &ra, pa, -shift, &mut excluded_b);
                 na_probes = eligible(&ra, &excluded_a);
@@ -1510,7 +1809,8 @@ impl<'s> Comparer<'s> {
                     {
                         (true, true, true)
                     } else {
-                        let (ea, eb) = (ca.rel(a, na), cb.rel(b, nb));
+                        // Island ends compared in A's offsets.
+                        let (ea, eb) = (ca.rel(a, na), cb.rel(b, nb) - shift);
                         (ea <= eb, eb <= ea, false)
                     }
                 }
@@ -1624,27 +1924,41 @@ impl<'s> Comparer<'s> {
         let (a, b) = (self.a, self.b);
         let mut seeds = Vec::new();
         let anchor_keys = |s: &AiipsSketch, promoted: bool| {
-            let mut keys: Vec<(u64, Origin, bool)> = (0..s.anchors.len() as u32)
-                .filter(|&t| s.is_promoted(t) == promoted)
-                .map(|t| {
-                    (
-                        s.anchors[t as usize].hash,
-                        Origin::Anchor(t),
-                        s.anchors[t as usize].reverse,
-                    )
-                })
-                .collect();
+            let key = |t: u32| {
+                let anchor = &s.anchors[t as usize];
+                (anchor.hash, Origin::Anchor(t), anchor.reverse)
+            };
+            let mut keys: Vec<(u64, Origin, bool)> = if promoted {
+                s.contigs
+                    .iter()
+                    .filter(|c| c.promoted)
+                    .map(|c| key(c.first))
+                    .collect()
+            } else {
+                s.contigs
+                    .iter()
+                    .flat_map(|c| (c.first + c.promoted as u32)..c.end)
+                    .map(key)
+                    .collect()
+            };
             keys.sort_unstable_by_key(|k| k.0);
             keys
         };
-        // Every sampled k2-mer (promoted anchors are also probes).
-        let k2_keys = |s: &AiipsSketch| {
-            let mut keys: Vec<(u64, Origin, bool)> = s
-                .probes
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (p.hash, Origin::Probe(i as u32), p.reverse))
-                .collect();
+        // The sampled k2-mers of `s` (promoted anchors are also probes)
+        // whose hash occurs in `wanted`, a sorted list of promoted anchors of
+        // the other genome: there are few of those, so this avoids sorting
+        // every probe.
+        let k2_keys = |s: &AiipsSketch, wanted: &[(u64, Origin, bool)]| {
+            let mut keys: Vec<(u64, Origin, bool)> = if wanted.is_empty() {
+                Vec::new()
+            } else {
+                s.probes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| wanted.binary_search_by_key(&p.hash, |k| k.0).is_ok())
+                    .map(|(i, p)| (p.hash, Origin::Probe(i as u32), p.reverse))
+                    .collect()
+            };
             keys.sort_unstable_by_key(|k| k.0);
             keys
         };
@@ -1663,7 +1977,8 @@ impl<'s> Comparer<'s> {
             });
         });
         // A's promoted anchors against B's k2-mers, walking forward in A.
-        join(&anchor_keys(a, true), &k2_keys(b), |x, y| {
+        let (a_promoted, b_promoted) = (anchor_keys(a, true), anchor_keys(b, true));
+        join(&a_promoted, &k2_keys(b, &a_promoted), |x, y| {
             let same = x.2 == y.2;
             seeds.push(Seed {
                 a: x.1,
@@ -1676,7 +1991,7 @@ impl<'s> Comparer<'s> {
         // B's promoted anchors against A's k2-mers, walking forward in B.
         // (When A's k2-mer is itself a promoted anchor and the strands
         // agree, the walk was seeded above.)
-        join(&k2_keys(a), &anchor_keys(b, true), |x, y| {
+        join(&k2_keys(a, &b_promoted), &b_promoted, |x, y| {
             let same = x.2 == y.2;
             let promoted = matches!(x.1, Origin::Probe(p) if a.promoted_probe(p));
             if !(same && promoted) {
@@ -1695,10 +2010,17 @@ impl<'s> Comparer<'s> {
 
     fn run(&self) -> Walks {
         let mut walks = Walks::default();
-        let mut consumed = HashSet::new();
+        let mut consumed = Consumed::default();
         let mut steps = Vec::new();
         let mut seeds = self.seeds();
         let mut reversed = Vec::new();
+        // k1 anchors crossed inside kept walks, per walk orientation
+        // (a_forward, b_forward): a seed whose two anchors an earlier walk of
+        // its orientation crossed lies on that walk, even when indels kept the
+        // pair from being crossed in the same step.
+        let mut crossed_a = vec![vec![false; self.a.anchors.len()]; 4];
+        let mut crossed_b = vec![vec![false; self.b.anchors.len()]; 4];
+        let class = |seed: &Seed| 2 * seed.a_forward as usize + seed.b_forward as usize;
         let mut next = 0;
         while next < seeds.len() || !reversed.is_empty() {
             if next == seeds.len() {
@@ -1711,7 +2033,10 @@ impl<'s> Comparer<'s> {
             let seed = seeds[next];
             next += 1;
             if let (Origin::Anchor(x), Origin::Anchor(y)) = (seed.a, seed.b) {
-                if consumed.contains(&(x, y, seed.a_forward, seed.b_forward)) {
+                let c = class(&seed);
+                if consumed.contains(&(x, y, seed.a_forward, seed.b_forward))
+                    || (crossed_a[c][x as usize] && crossed_b[c][y as usize])
+                {
                     continue;
                 }
             }
@@ -1724,6 +2049,15 @@ impl<'s> Comparer<'s> {
                 });
             }
             self.walk(&seed, &mut steps, &mut consumed);
+            let c = class(&seed);
+            for step in steps.iter() {
+                if let Some((anchor, _)) = step.a_cross {
+                    crossed_a[c][anchor as usize] = true;
+                }
+                if let Some((anchor, _)) = step.b_cross {
+                    crossed_b[c][anchor as usize] = true;
+                }
+            }
             if steps.is_empty() {
                 continue;
             }
@@ -1768,6 +2102,38 @@ impl<'s> Comparer<'s> {
         walks
     }
 }
+
+/// Multiply-rotate hasher for the small integer keys of [`Consumed`]
+/// (indices into one comparison's sketches; no untrusted keys).
+#[derive(Default)]
+struct IndexHasher(u64);
+
+impl Hasher for IndexHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(byte as u64);
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(i as u64);
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+/// Anchor pairs (with walk directions) already walked through.
+type Consumed = HashSet<(u32, u32, bool, bool), BuildHasherDefault<IndexHasher>>;
 
 /// Upstream seeds first (in A, along the walk direction), so walks consume
 /// the seeds they pass.

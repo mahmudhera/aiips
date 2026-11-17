@@ -233,10 +233,26 @@ by the FracMinHash rule. Per record (contig):
 
 Every k-mer keeps its position and strand. With the defaults a 5 Mbp genome has
 about 10,000 anchors and 50,000 probes. Sketching is one pass and two hashes per
-base; records are scanned as 8 segments side by side so the work maps onto vector
-registers, compiled for AVX-512, AVX2 and baseline x86-64 and chosen at runtime
-(other architectures use the baseline code). Every path gives identical sketches.
-`valid_kmers` counts probe-length (k2) windows.
+base:
+
+- Each record is decoded in 64 Ki-base chunks straight from the parser's buffer:
+  line breaks are dropped on the fly (lines are cut where the first line's width
+  predicts, checked against the record's line-break count, else found by
+  search) and eight bases are encoded at a time with word arithmetic.
+- A chunk is scanned as 8 segments side by side, so the rolling codes, both hashes
+  and both threshold tests of 8 positions advance together in vector registers.
+  Lanes read eight bases at a time, transposed with word arithmetic; each lane
+  warms up on the k1 - 1 bases before its segment (carried over between chunks).
+  The scan is compiled for AVX-512, AVX2 and baseline x86-64 and chosen at
+  runtime (other architectures use the baseline code).
+- About nine steps in ten sample nothing and cost only the threshold test; the
+  others are buffered with their hashes and strands and emitted in bulk.
+- Per-record buffers are kept by the thread and reused by the next sketch.
+
+Every path gives identical sketches; the tests compare them with a brute-force
+builder, line-wrapped input included. Besides the sketch, memory holds the parser's
+buffer (the longest record) and the chunk buffers. `valid_kmers` counts
+probe-length (k2) windows.
 
 `compare` with AIIPS sketches, or with `-a aiips` for two sequence inputs:
 
@@ -248,9 +264,12 @@ registers, compiled for AVX-512, AVX2 and baseline x86-64 and chosen at runtime
    matched k-mer in the other, each genome keeping its own islands. When the next
    anchors are the same k-mer both genomes cross them and the walk re-anchors;
    otherwise the genome whose island ends first (by island length) crosses its
-   next anchor, so an island can pair with several of the other genome's. A seed
+   next anchor, so an island can pair with several of the other genome's. Island
+   ends are compared after correcting for the offset between the genomes measured
+   at the last shared probe, which indels change between re-anchorings. A seed
    walks forward from the anchor in each genome whose anchor it is (one walk if the
-   strands agree, two if not).
+   strands agree, two if not), unless an earlier walk in that orientation crossed
+   both its anchors.
 3. An island is judged when the walk leaves it, from all the probes it shared with
    the islands it was paired with: it is high enough when that fraction is at
    least `X^k2` (`--min-island-ani X`, default 0.8, so effectively one shared
@@ -458,10 +477,12 @@ Command-specific help takes precedence over invalid arguments anywhere before
   MinHash construction and estimators (`minhash.rs`), and FracMinHash
   construction and estimators (`fracminhash.rs`). FracMinHash comparison merges
   the two sorted sketches in linear time.
-- `src/sketch/aiips.rs` holds AIIPS sketching (vectorized scan with runtime
-  instruction-set dispatch, no extra dependencies), the format, the walk, and the
-  likelihood. Comparison joins sorted seed hashes and touches each island a
-  bounded number of times; its memory is linear in the sketch sizes.
+- `src/sketch/aiips.rs` holds AIIPS sketching (streamed decoding and a
+  vectorized scan with runtime instruction-set dispatch, no extra dependencies),
+  the format, the walk, and the likelihood. Comparison joins the sorted k1 anchor
+  hashes, matches the few promoted anchors by binary search instead of sorting all
+  probes, and touches each island a bounded number of times; its memory is linear
+  in the sketch sizes.
 - The binary separates argument parsing, command execution and output handling,
   and TSV formatting. Memory scales with parser buffering and the largest record.
 
@@ -473,14 +494,17 @@ unimplemented.
 ## Benchmark against skani
 
 `scripts/simulate.py OUTDIR` (standard library, fixed seeds) writes 32 pairs of
-5 Mbp genomes with known ANI and AF, and `scripts/benchmark.py` runs aiips and
-skani on them (one thread, FASTA inputs, so sketching is included; wall time and
-peak memory from `/usr/bin/time`, fastest of `--repeat` runs):
+genomes (5 Mbp by default, `--length` to change) with known ANI and AF, and
+`scripts/benchmark.py` runs aiips and skani on them: one thread, FASTA inputs (so
+sketching is included), optionally pinned to one core with `--cpu`. Wall time is
+measured around each process, user and system CPU time come from `getrusage`, and
+peak memory from `/usr/bin/time`; the fastest of `--repeat` runs is kept.
+`--other-aiips LABEL=PATH` adds another aiips binary, e.g. an earlier build:
 
 ```sh
-python3 scripts/simulate.py sim
+python3 scripts/simulate.py sim --length 10000000
 python3 scripts/benchmark.py sim/truth.tsv results.tsv --aiips target/release/aiips \
-    --skani "$(command -v skani)" --repeat 3 \
+    --skani "$(command -v skani)" --repeat 3 --cpu 1 \
     --variant both="--symmetric-probes --bidirectional"
 ```
 
@@ -493,48 +517,51 @@ or in contigs of mean 50, 10 or 3 kbp in random orientation; and A with repeat
 families (40 families, 2-5 copies of 1-7 kbp, up to 1% diverged) against B
 substituted, cut into about 40 blocks, shuffled and partly inverted.
 
-Results (`benchmarks/simulated-5mb.tsv`; truth in
-`benchmarks/simulated-5mb-truth.tsv`), with skani 0.4.0 at its defaults and
-`--min-af 0`. Errors are in percentage points, AF over both directions; time and
-memory are per pair on one thread of a shared Xeon Gold 5416S, where timings
-vary from run to run, so the tools were run interleaved:
+Results for 10 Mbp genomes (`benchmarks/simulated-10mb.tsv`; truth in
+`benchmarks/simulated-10mb-truth.tsv`), with skani 0.4.0 at its defaults and
+`--min-af 0`, and the initial aiips implementation for reference. Errors are mean
+absolute errors in percentage points, AF over both directions. Time and memory
+are per pair, on one pinned core of a shared Xeon Gold 5416S; timings vary with
+the machine's load, so all tools were run interleaved, fastest of 3:
 
-| Scenarios | Tool | ANI MAE | ANI bias | AF MAE | Time (s) | Memory (MiB) |
-|---|---|---|---|---|---|---|
-| Substitutions (8) | aiips | 0.17 | -0.17 | 1.5 | 0.050 | 20.4 |
-| Substitutions (8) | aiips, both flags | 0.05 | +0.05 | 0.5 | 0.054 | 20.4 |
-| Substitutions (8) | skani (1 pair not reported) | 0.45 | -0.44 | 11.1 | 0.040 | 18.8 |
-| Partial overlap (9) | aiips | 0.21 | -0.21 | 2.3 | 0.043 | 19.4 |
-| Partial overlap (9) | aiips, both flags | 0.08 | -0.03 | 0.5 | 0.050 | 19.3 |
-| Partial overlap (9) | skani | 0.88 | -0.88 | 3.4 | 0.036 | 17.7 |
-| Indels + draft contigs (12) | aiips | 0.64 | -0.64 | 10.7 | 0.053 | 19.4 |
-| Indels + draft contigs (12) | aiips, both flags | 0.43 | -0.43 | 8.0 | 0.066 | 19.4 |
-| Indels + draft contigs (12) | skani | 0.82 | -0.82 | 11.7 | 0.040 | 17.5 |
-| Repeats + rearrangements (3) | aiips | 0.12 | -0.12 | 1.1 | 0.057 | 21.5 |
-| Repeats + rearrangements (3) | aiips, both flags | 0.08 | +0.08 | 0.4 | 0.077 | 21.5 |
-| Repeats + rearrangements (3) | skani | 0.28 | -0.28 | 4.7 | 0.040 | 18.9 |
-| All 32 | aiips | 0.35 | -0.35 | 5.1 | 0.050 | 19.8 |
-| All 32 | aiips, both flags | 0.20 | -0.15 | 3.3 | 0.059 | 19.8 |
-| All 32 | skani (1 pair not reported) | 0.70 | -0.70 | 8.5 | 0.039 | 18.0 |
+| Scenarios | Tool | ANI MAE | AF MAE | Wall (s) | User (s) | System (s) | Memory (MiB) |
+|---|---|---|---|---|---|---|---|
+| Substitutions (8) | aiips | 0.14 | 1.3 | 0.103 | 0.074 | 0.028 | 26.2 |
+| Substitutions (8) | aiips, both flags | 0.07 | 0.4 | 0.110 | 0.083 | 0.026 | 26.2 |
+| Substitutions (8) | skani (1 pair not reported) | 0.44 | 11.2 | 0.124 | 0.083 | 0.041 | 39.9 |
+| Partial overlap (9) | aiips | 0.19 | 2.2 | 0.082 | 0.060 | 0.021 | 24.3 |
+| Partial overlap (9) | aiips, both flags | 0.06 | 0.5 | 0.086 | 0.064 | 0.022 | 24.3 |
+| Partial overlap (9) | skani | 1.09 | 3.1 | 0.089 | 0.059 | 0.030 | 34.1 |
+| Indels + draft contigs (12) | aiips | 0.63 | 10.7 | 0.084 | 0.065 | 0.018 | 24.2 |
+| Indels + draft contigs (12) | aiips, both flags | 0.43 | 7.8 | 0.087 | 0.068 | 0.019 | 24.2 |
+| Indels + draft contigs (12) | skani | 0.84 | 11.7 | 0.085 | 0.061 | 0.024 | 33.6 |
+| Repeats + rearrangements (3) | aiips | 0.14 | 0.6 | 0.069 | 0.050 | 0.018 | 26.0 |
+| Repeats + rearrangements (3) | aiips, both flags | 0.06 | 0.3 | 0.075 | 0.057 | 0.017 | 26.0 |
+| Repeats + rearrangements (3) | skani | 0.29 | 4.9 | 0.076 | 0.048 | 0.027 | 39.9 |
+| All 32 | aiips | 0.34 | 5.0 | 0.087 | 0.064 | 0.022 | 24.9 |
+| All 32 | aiips, both flags | 0.20 | 3.2 | 0.091 | 0.070 | 0.021 | 24.9 |
+| All 32 | skani (1 pair not reported) | 0.77 | 8.4 | 0.095 | 0.065 | 0.030 | 35.9 |
+| All 32 | aiips, initial implementation | 0.34 | 5.0 | 0.118 | 0.086 | 0.031 | 38.2 |
 
 Substitution sweep, ANI / AF of A:
 
 | True ANI | aiips | aiips, both flags | skani |
 |---|---|---|---|
-| 0.9990 | 0.9989 / 1.000 | 0.9990 / 1.000 | 0.9991 / 1.000 |
+| 0.9990 | 0.9990 / 1.000 | 0.9990 / 1.000 | 0.9991 / 1.000 |
 | 0.9900 | 0.9896 / 1.000 | 0.9903 / 1.000 | 0.9892 / 0.999 |
-| 0.9699 | 0.9687 / 1.000 | 0.9705 / 1.000 | 0.9677 / 0.992 |
-| 0.9500 | 0.9481 / 1.000 | 0.9504 / 1.000 | 0.9438 / 0.986 |
-| 0.9199 | 0.9175 / 1.000 | 0.9204 / 1.000 | 0.9153 / 0.949 |
-| 0.9001 | 0.8975 / 0.999 | 0.9006 / 1.000 | 0.8975 / 0.875 |
-| 0.8496 | 0.8461 / 0.998 | 0.8495 / 0.999 | 0.8348 / 0.423 |
-| 0.7998 | 0.7981 / 0.887 | 0.8015 / 0.966 | not reported |
+| 0.9699 | 0.9686 / 1.000 | 0.9704 / 1.000 | 0.9677 / 0.993 |
+| 0.9499 | 0.9481 / 1.000 | 0.9505 / 1.000 | 0.9438 / 0.985 |
+| 0.9199 | 0.9177 / 1.000 | 0.9205 / 1.000 | 0.9153 / 0.948 |
+| 0.8999 | 0.8975 / 1.000 | 0.9006 / 1.000 | 0.8985 / 0.875 |
+| 0.8497 | 0.8472 / 0.999 | 0.8505 / 1.000 | 0.8342 / 0.415 |
+| 0.8000 | 0.7991 / 0.896 | 0.8025 / 0.968 | not reported |
 
 Both tools underestimate ANI when indels are frequent (k-mers spanning an indel
-are lost), and both lose AF on 3 kbp contigs at 90% ANI (aiips 0.47-0.51 with both
-flags, skani 0.49). Simulated genomes are uniform random sequence, without the
-compositional structure of real genomes; skani's learned ANI regression was
-trained on real assemblies.
+are lost), and both lose AF on 3 kbp contigs at 90% ANI (aiips 0.41-0.50, skani
+0.50). Simulated genomes are uniform random sequence, without the compositional
+structure of real genomes; skani's learned ANI regression was trained on real
+assemblies. `benchmarks/simulated-5mb.tsv` holds the same benchmark on 5 Mbp
+genomes from the initial implementation.
 
 ## Tests
 
@@ -586,8 +613,11 @@ SplitMix64 is checked against its published reference outputs, fmix64 by
 inversion.
 AIIPS sketches are checked against a brute-force builder (every window hashed
 from scratch, exclusion and promotion applied literally) on records with
-ambiguous bases, lane boundaries, and short and empty records, for every
-instruction set the machine offers; the likelihood against its closed form and a
+ambiguous bases, lane and chunk boundaries, short and empty records, and line
+breaks (LF, CRLF, ragged and blank lines), for every instruction set the machine
+offers; the word encoder against the lookup table for every byte, the 8x8 byte
+transpose against a naive one, and decoding against plain line-break removal
+(including a mispredicted line width, which must be caught); the likelihood against its closed form and a
 grid search; and comparisons against exact cases (identical genomes, reverse
 complement cut into contigs, half shared with a breakpoint, unrelated genomes) and
 1 Mbp genomes substituted at 1% and 5%.
