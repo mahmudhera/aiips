@@ -21,9 +21,12 @@
 //!    A or in B, exceeds G. While the run has only its seed, G = `run_max_gap`;
 //!    otherwise G = min(`run_max_gap`, `run_gap_factor` · s · walked /
 //!    supports), where s = 1 / (1/c1 + 1/c2) is the expected number of A bases
-//!    per sampled k-mer and walked counts the k-mers visited, seed included.
-//!    s · walked / supports estimates the run's spacing between supports from
-//!    its hit rate; it is a heuristic stopping rule, not a calibrated test.
+//!    per sampled k-mer and walked counts the k-mers visited up to the run's
+//!    latest support, seed included. s · walked / supports estimates the run's
+//!    spacing between supports from its hit rate over its supported part;
+//!    misses after the latest support do not enlarge G, so a run cannot walk
+//!    far past a break and pick up its old offset again. It is a heuristic
+//!    stopping rule, not a calibrated test.
 //! 4. **Accept.** A run needs `run_min_supports` supports, seed included.
 //!    Runs that overlap on either genome are resolved by descending support
 //!    count: a weaker run keeps only its supports outside kept runs, split into
@@ -31,10 +34,13 @@
 //!    dropped.
 //! 5. **ANI.** Every probe occurrence inside an accepted run's interval counts
 //!    on each side, including the run's end supports, probes overlapping
-//!    anchors and repeated hashes. X_A counts A occurrences whose hash occurs
-//!    in the B interval, X_B the reverse. Pooled over runs,
-//!    q = (X_A + X_B) / (N_A + N_B), which equals 2X / (N_A + N_B) when every
-//!    hash is unique, and ANI = q^(1/k2).
+//!    anchors and repeated hashes. A probe matches *positionally*: when its hash
+//!    occurs, with the run's strand relation, in the other genome near the
+//!    place the run maps it to, that is with an offset within `run_band` of the
+//!    offset of either flanking support. Copies elsewhere never match, so a
+//!    repeat cannot match through another copy. X_A and X_B count the matched
+//!    probes of each side; pooled over runs, q = (X_A + X_B) / (N_A + N_B) and
+//!    ANI = q^(1/k2).
 //! 6. **AF.** Each run interval, [first support, last support end), is padded
 //!    by `run_pad` bases on both sides (default: the probe scale c2, as skani
 //!    pads chains by its c), clipped to the contig. AF is the union over runs
@@ -75,8 +81,8 @@ pub struct RunCounts {
     /// Accepted runs (pieces), and their supports.
     pub accepted_runs: u64,
     pub supports: u64,
-    /// Probe occurrences in accepted runs (N_A, N_B), and those whose hash
-    /// occurs in the other genome's run interval (X_A, X_B).
+    /// Probe occurrences in accepted runs (N_A, N_B), and those matched
+    /// positionally in the other genome (X_A, X_B).
     pub probes_a: u64,
     pub probes_b: u64,
     pub matched_a: u64,
@@ -291,6 +297,23 @@ impl<'s> Lookup<'s> {
         lo: i64,
         hi: i64,
     ) -> Found {
+        self.find_in(i, range_b, len_b, reverse, reverse, lo, hi)
+    }
+
+    /// As [`Self::find`], with the window [lo, hi] in B's oriented coordinates
+    /// when `flip` (else forward), and copies kept when strand_A XOR strand_B
+    /// equals `reverse`.
+    #[allow(clippy::too_many_arguments)]
+    fn find_in(
+        &self,
+        i: usize,
+        range_b: &Range<usize>,
+        len_b: i64,
+        flip: bool,
+        reverse: bool,
+        lo: i64,
+        hi: i64,
+    ) -> Found {
         let entry = self.to_b[self.a.ids[i] as usize];
         if entry == NONE {
             return Found::None;
@@ -300,7 +323,7 @@ impl<'s> Lookup<'s> {
         let from = list.partition_point(|&o| (o as usize) < range_b.start);
         let to = list.partition_point(|&o| (o as usize) < range_b.end);
         let list = &list[from..to];
-        let (low, high) = if reverse {
+        let (low, high) = if flip {
             (len_b - self.k - hi, len_b - self.k - lo)
         } else {
             (lo, hi)
@@ -317,7 +340,7 @@ impl<'s> Lookup<'s> {
             if (self.b.strands.get(o as usize) != strand_a) != reverse {
                 continue;
             }
-            let y = if reverse { len_b - self.k - p } else { p };
+            let y = if flip { len_b - self.k - p } else { p };
             found = match found {
                 Found::None => Found::One(y),
                 _ => return Found::Many,
@@ -363,8 +386,12 @@ impl Cursor {
 
 /// The run's hit-rate bookkeeping, shared by both walks.
 struct Progress {
+    /// K-mers visited, seed included.
     walked: u64,
     supports: u64,
+    /// `walked` when the latest support was found: the hit rate covers the
+    /// supported part of the run only.
+    walked_at_support: u64,
 }
 
 struct Walker<'s> {
@@ -407,8 +434,9 @@ impl<'s> Walker<'s> {
         if p.supports <= 1 {
             self.max_gap
         } else {
-            self.max_gap
-                .min(self.gap_factor * self.spacing * p.walked as f64 / p.supports as f64)
+            self.max_gap.min(
+                self.gap_factor * self.spacing * p.walked_at_support as f64 / p.supports as f64,
+            )
         }
     }
 
@@ -429,6 +457,7 @@ impl<'s> Walker<'s> {
         let mut progress = Progress {
             walked: 1,
             supports: 1,
+            walked_at_support: 1,
         };
         let mut right = Vec::new();
         self.walk(
@@ -562,6 +591,7 @@ impl<'s> Walker<'s> {
                     frontier = Support { x, y: y as u32, k };
                     out.push(frontier);
                     progress.supports += 1;
+                    progress.walked_at_support = progress.walked;
                     if take_anchor {
                         absorbed.push(i);
                     }
@@ -736,17 +766,15 @@ fn runs_with(walker: &Walker, config: &LocalConfig) -> (Vec<Run>, RunCounts) {
     (kept, counts)
 }
 
-/// Occurrences on each side whose entry occurs on the other side: entries of
-/// A are already translated to B's dictionary (NONE when absent from B).
-fn matched(a: &mut [u32], b: &mut [u32]) -> (u64, u64) {
-    a.sort_unstable();
-    b.sort_unstable();
-    let x_a = a
-        .iter()
-        .filter(|&&e| e != NONE && b.binary_search(&e).is_ok())
-        .count();
-    let x_b = b.iter().filter(|&&e| a.binary_search(&e).is_ok()).count();
-    (x_a as u64, x_b as u64)
+/// Offsets (oriented B start minus A start) of the supports flanking a
+/// position, found by `key` (A start, or oriented B start, of each support).
+fn flanking(supports: &[Support], at: i64, key: impl Fn(&Support) -> i64) -> (i64, i64) {
+    let next = supports.partition_point(|s| key(s) <= at);
+    let offset = |s: &Support| i64::from(s.y) - i64::from(s.x);
+    let before = supports[next.saturating_sub(1)];
+    let after = supports[next.min(supports.len() - 1)];
+    let (d0, d1) = (offset(&before), offset(&after));
+    (d0.min(d1), d0.max(d1))
 }
 
 /// Probe occurrences of `contig` lying wholly inside [start, end).
@@ -768,25 +796,51 @@ pub fn estimate(a: &AiipsSketch, b: &AiipsSketch, config: &LocalConfig) -> Local
         .run_pad
         .map_or(a.params.probe_scaled, u64::from)
         .min(u64::from(u32::MAX));
-    let lookup = &walker.probes;
-    let (mut side_a, mut side_b) = (Vec::new(), Vec::new());
+    let (a_to_b, b_to_a) = (&walker.probes, Lookup::new(b.probes(), a.probes(), k2));
+    let (k, band) = (i64::from(k2), i64::from(config.run_band));
     let (mut covered_a, mut covered_b) = (Vec::new(), Vec::new());
     for run in &kept {
         let (a0, a1) = run.span_a();
         let (b0, b1) = run.span_b(b.contigs().length(run.contig_b));
-        side_a.clear();
-        side_a.extend(
-            probes_within(a, run.contig_a, a0, a1).map(|i| lookup.to_b[a.probes().ids[i] as usize]),
-        );
-        side_b.clear();
-        side_b.extend(probes_within(b, run.contig_b, b0, b1).map(|i| b.probes().ids[i]));
-        let (x_a, x_b) = matched(&mut side_a, &mut side_b);
-        counts.probes_a += side_a.len() as u64;
-        counts.probes_b += side_b.len() as u64;
-        counts.matched_a += x_a;
-        counts.matched_b += x_b;
         let len_a = u64::from(a.contigs().length(run.contig_a));
         let len_b = u64::from(b.contigs().length(run.contig_b));
+        let (range_a, range_b) = (
+            a.contigs().probes(run.contig_a),
+            b.contigs().probes(run.contig_b),
+        );
+        // A probe at x maps to oriented B starts x + d, d between the
+        // flanking supports' offsets.
+        for i in probes_within(a, run.contig_a, a0, a1) {
+            let x = i64::from(a.probes().positions[i]);
+            let (low, high) = flanking(&run.supports, x, |s| i64::from(s.x));
+            let found = a_to_b.find(
+                i,
+                &range_b,
+                len_b as i64,
+                run.reverse,
+                x + low - band,
+                x + high + band,
+            );
+            counts.probes_a += 1;
+            counts.matched_a += u64::from(!matches!(found, Found::None));
+        }
+        // A B probe at oriented y maps to A starts y - d.
+        for j in probes_within(b, run.contig_b, b0, b1) {
+            let p = i64::from(b.probes().positions[j]);
+            let y = if run.reverse { len_b as i64 - k - p } else { p };
+            let (low, high) = flanking(&run.supports, y, |s| i64::from(s.y));
+            let found = b_to_a.find_in(
+                j,
+                &range_a,
+                len_a as i64,
+                false,
+                run.reverse,
+                y - high - band,
+                y - low + band,
+            );
+            counts.probes_b += 1;
+            counts.matched_b += u64::from(!matches!(found, Found::None));
+        }
         covered_a.push((run.contig_a, a0.saturating_sub(pad), (a1 + pad).min(len_a)));
         covered_b.push((run.contig_b, b0.saturating_sub(pad), (b1 + pad).min(len_b)));
     }
@@ -1105,12 +1159,21 @@ mod tests {
         let walker = Walker::new(&a, &b, &config());
         // 1 / (1/125 + 1/125) = 62.5 bases per sampled k-mer.
         assert_eq!(walker.spacing, 62.5);
-        let gap = |walked, supports| walker.gap(&Progress { walked, supports });
-        assert_eq!(gap(1, 1), 20_000.0);
-        assert_eq!(gap(50, 1), 20_000.0);
-        assert_eq!(gap(20, 10), 10.0 * 62.5 * 2.0);
-        assert_eq!(gap(100, 100), 625.0);
-        assert_eq!(gap(10_000, 10), 20_000.0);
+        let gap = |walked, supports, walked_at_support| {
+            walker.gap(&Progress {
+                walked,
+                supports,
+                walked_at_support,
+            })
+        };
+        assert_eq!(gap(1, 1, 1), 20_000.0);
+        assert_eq!(gap(50, 1, 1), 20_000.0);
+        assert_eq!(gap(20, 10, 20), 10.0 * 62.5 * 2.0);
+        assert_eq!(gap(100, 100, 100), 625.0);
+        assert_eq!(gap(10_000, 10, 10_000), 20_000.0);
+        // Misses after the latest support leave the gap unchanged.
+        assert_eq!(gap(5_000, 100, 100), 625.0);
+        assert_eq!(gap(50, 10, 20), gap(20, 10, 20));
     }
 
     #[test]
@@ -1144,13 +1207,109 @@ mod tests {
     }
 
     #[test]
-    fn repeated_hashes_count_per_occurrence() {
-        let mut a = vec![5, 5, 7, NONE];
-        let mut b = vec![9, 5];
-        assert_eq!(matched(&mut a, &mut b), (2, 1));
-        let mut a = vec![NONE, NONE];
-        let mut b = vec![1, 2];
-        assert_eq!(matched(&mut a, &mut b), (0, 0));
+    fn probes_match_only_near_the_place_the_run_maps_them_to() {
+        // B's copy of A[40000, 40300) is replaced by a copy of A[70000, 70300):
+        // those B probes occur in A, but 30 kb away from where the run maps them.
+        let genome = random_bases(28, 100_000);
+        let mut b = genome.clone();
+        b.copy_within(70_000..70_300, 40_000);
+        let (sa, sb) = sketches(&[&genome], &[&b], &dense());
+        // A loose gap rule, so that one run spans the replaced stretch.
+        let loose = LocalConfig {
+            run_gap_factor: 100.0,
+            ..config()
+        };
+        let (kept, _) = runs(&sa, &sb, &loose);
+        assert!(kept
+            .iter()
+            .any(|r| r.span_a().0 < 40_000 && r.span_a().1 > 40_300));
+        let moved: Vec<usize> = (0..sb.probes().len())
+            .filter(|&j| (40_000..40_300 - 15).contains(&sb.probes().positions[j]))
+            .collect();
+        assert!(moved.len() > 10);
+        assert!(moved.iter().all(|&j| sa
+            .global_probes()
+            .binary_search(&sb.probes().hash(j))
+            .is_ok()));
+        let replaced = (0..sa.probes().len())
+            .filter(|&i| (40_000..40_300 - 15).contains(&sa.probes().positions[i]))
+            .count() as u64;
+        let r = estimate(&sa, &sb, &loose).runs.unwrap();
+        // None of the moved B probes match; nor do A's probes they replaced.
+        assert!(r.matched_b + moved.len() as u64 <= r.probes_b, "{r:?}");
+        assert!(r.matched_a + replaced <= r.probes_a, "{r:?}");
+    }
+
+    #[test]
+    fn runs_do_not_cross_long_stretches_at_another_offset() {
+        // 100-bp insertions into B, each undone by a 100-bp deletion 6 kb later,
+        // at 95% identity: the offset leaves and returns to the original one.
+        // With a 50-bp band, runs break at each indel and must not walk on and
+        // pick up the original offset 6 kb later, which would score the
+        // stretch in between at the wrong offset.
+        let genome = random_bases(29, 120_000);
+        let mutated = substitute(&genome, 6_000, 6);
+        let (mut b, mut aligned, mut same) = (Vec::new(), 0usize, 0usize);
+        let mut i = 0;
+        let mut event = 0;
+        while i < genome.len() {
+            if i % 6_000 == 3_000 && i + 3_000 < genome.len() {
+                if event % 2 == 0 {
+                    b.extend(random_bases(30 + event as u64, 100));
+                } else {
+                    i += 100;
+                }
+                event += 1;
+            }
+            b.push(mutated[i]);
+            aligned += 1;
+            same += usize::from(mutated[i] == genome[i]);
+            i += 1;
+        }
+        let truth = same as f64 / aligned as f64;
+        let narrow = LocalConfig {
+            run_gap_factor: 20.0,
+            run_max_gap: 50_000,
+            run_band: 50,
+            run_min_supports: 2,
+            ..config()
+        };
+        let (sa, sb) = sketches(&[&genome], &[&b], &standard());
+        let (kept, _) = runs(&sa, &sb, &narrow);
+        let longest = kept
+            .iter()
+            .flat_map(|r| r.supports.windows(2).map(|w| w[1].x - w[0].x))
+            .max()
+            .unwrap();
+        assert!(
+            longest < 4_000,
+            "a run crossed {longest} bases without support"
+        );
+        let ani = estimate(&sa, &sb, &narrow).ani.unwrap();
+        assert!((ani - truth).abs() < 0.004, "{ani} vs {truth}");
+    }
+
+    #[test]
+    fn repeats_do_not_bias_identity() {
+        // 12 copies of a 3 kb element in 200 kb, every copy mutated
+        // independently, 6 simulations: counting a repeated hash as matched
+        // through any copy read about 1.7 pp high here. One 200 kb genome at
+        // 90% identity has a sampling error of about 0.3 pp, so the mean of
+        // 6 is tested.
+        let mut errors = Vec::new();
+        for seed in 0..6u64 {
+            let element = random_bases(40 + seed, 3_000);
+            let mut genome = random_bases(50 + seed, 200_000);
+            for copy in 0..12 {
+                let at = 5_000 + copy * 16_000;
+                genome[at..at + element.len()].copy_from_slice(&element);
+            }
+            let mutated = substitute(&genome, 20_000, 60 + seed);
+            let e = compare(&[&genome], &[&mutated], &standard(), &config());
+            errors.push(e.ani.unwrap() - 0.9);
+        }
+        let mean = errors.iter().sum::<f64>() / errors.len() as f64;
+        assert!(mean.abs() < 0.0025, "{errors:?}");
     }
 
     #[test]

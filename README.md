@@ -636,29 +636,39 @@ values, not tuned.
    same contig pair (left walks), or when the gap since the last support, in A
    or B, exceeds `G = min(--run-max-gap [20000], --run-gap-factor [10] · s · n / m)`.
    Here `s = 1 / (1/c1 + 1/c2)` is the expected number of A bases per sampled
-   k-mer, `n` the k-mers visited and `m` the supports, seed included; with only
-   the seed, `G = --run-max-gap`. `s · n / m` estimates the run's spacing
-   between supports from its hit rate. This is a heuristic stopping rule, not a
-   calibrated test: in identical sequence, a run stops early about once every
-   `s · e^t` bases (1.4 Mb at the defaults), and the next seed starts a new run.
+   k-mer, `n` the k-mers visited up to the run's latest support and `m` the
+   supports, seed included; with only the seed, `G = --run-max-gap`. `s · n / m`
+   estimates the run's spacing between supports from its hit rate over its
+   supported part. Misses after the latest support do not enlarge `G`: otherwise
+   a young run could walk tens of kb past an indel wider than the band and pick
+   up its old offset again, scoring the stretch in between at the wrong offset.
+   This is a heuristic stopping rule, not a calibrated test: in identical
+   sequence, a run stops early about once every `s · e^t` bases (1.4 Mb at the
+   defaults), and the next seed starts a new run.
 4. *Accept.* A run needs `--run-min-supports` [3] supports, seed included. Where
    runs overlap on either genome, the run with more supports is kept and the
    other keeps only its supports outside it; pieces with too few supports are
    dropped.
 5. *ANI.* Every probe occurrence inside an accepted run counts, including the
-   run's end supports, probes overlapping anchors, and repeated hashes; an
-   occurrence matches when its hash occurs in the other genome's run interval.
-   `q = (X_A + X_B) / (N_A + N_B)` pooled over runs, and `ANI = q^(1/k2)`; null
-   under the conditions given for blocks (`--min-scoring-probes` applies).
+   run's end supports, probes overlapping anchors, and repeated hashes. A probe
+   matches *positionally*: when its hash occurs, with the run's strand relation,
+   in the other genome near the place the run maps it to, that is with an offset
+   (B − A position) within `--run-band` of either flanking support's offset.
+   Copies elsewhere never match, so a repeat cannot match through another copy.
+   `q = (X_A + X_B) / (N_A + N_B)` pooled over runs, with `X_A`, `X_B` the
+   matched probes of each side, and `ANI = q^(1/k2)`; null under the conditions
+   given for blocks (`--min-scoring-probes` applies).
 6. *AF.* Each run interval is padded by `--run-pad` bases on both sides (default:
    the probe scale `c2`, as skani pads its chains by its `c`), clipped to the
    contig; AF is the union divided by the genome's bases.
 
-ANI reads high on genomes with repeats, most likely because a repeated hash
-counts as matched when any copy survives: on simulated
-E. coli pairs with uniform substitutions it read 0.04-0.05 pp high at 99%,
-0.12-0.19 pp at 95% and 0.46-0.56 pp at 90%, against -0.01 to +0.14 pp on random
-sequence. To be investigated later: using the indel shifts within the band in
+Matching positionally replaced an earlier rule that let a probe match its hash
+anywhere in the other genome's run interval, which read high on repeats: by
+about 1.7 pp on a 200 kb genome holding 12 copies of a 3 kb element at 90%
+identity (8 simulations), where positional matching is within 0.01 pp on
+average. Leaving repeated hashes out instead (as blocks do) overcorrected: a
+genome-long run holds every copy, so the copies are left out of A while their
+independently mutated copies in B still count as misses. To be investigated later: using the indel shifts within the band in
 the ANI estimate; correcting for the matches at run ends; a joint probe and anchor
 likelihood (leaving out probes that overlap anchors); the fragment and
 mixed-identity corrections; and probes as seeds for short contigs.
@@ -671,7 +681,8 @@ The diagnostics table for runs has `local_method` (`runs`) followed by:
 - `runs_short`, `runs_trimmed`, `runs_dropped`: runs below the support minimum,
   trimmed by overlaps, and dropped by overlaps;
 - `accepted_runs`, `supports`;
-- `probes_a`, `probes_b`, `matched_a`, `matched_b`: `N_A`, `N_B`, `X_A`, `X_B`;
+- `probes_a`, `probes_b`, `matched_a`, `matched_b`: `N_A`, `N_B`, and the
+  positionally matched `X_A`, `X_B`;
 - `covered_bases_a`, `covered_bases_b`: AF numerators.
 
 The global columns, `af_containment_*` and statuses are as for blocks.
