@@ -187,6 +187,7 @@ R10 = load(os.path.join(REPO, "benchmarks/simulated-10mb.tsv"))
 R5 = load(os.path.join(REPO, "benchmarks/simulated-5mb.tsv"))
 GAP = load(os.path.join(REPO, "benchmarks/simulated-5mb-gap-sweep.tsv"))
 KSWEEP = load(os.path.join(REPO, "benchmarks/simulated-10mb-ksweep.tsv"))
+LENGTHS = {n: load(os.path.join(REPO, f"benchmarks/simulated-length-{n}mb.tsv")) for n in (10, 50, 100)}
 TRUTH10 = load(os.path.join(REPO, "benchmarks/simulated-10mb-truth.tsv"))
 
 TOOLS = [("skani", "skani 0.4.0"), ("committed", "aiips, previous commit"), ("aiips", "aiips, this commit"),
@@ -468,7 +469,8 @@ bullets([
     "largest below 90% ANI, where skani's AF falls to about 0.4 for genomes that are entirely homologous.",
     f"<b>Cost.</b> Per genome pair (single thread, sketching included) AIIPS takes {a_['wall_s']:.0f} ms and "
     f"{a_['rss']:.1f} MiB of peak memory, against {s_['wall_s']:.0f} ms and {s_['rss']:.1f} MiB for skani; the previous "
-    f"commit took {ALL['committed']['wall_s']:.0f} ms and {ALL['committed']['rss']:.1f} MiB.",
+    f"commit took {ALL['committed']['wall_s']:.0f} ms and {ALL['committed']['rss']:.1f} MiB. The advantage holds on "
+    "50 and 100 Mbp genomes (Section 6.8).",
     f"<b>Weak spots.</b> Both tools underestimate ANI when small indels are frequent (at 90–95% ANI by "
     f"{IND['aiips:both'][0]:.1f}–{IND['aiips'][1]:.1f} points for AIIPS, {IND['skani'][0]:.1f}–{IND['skani'][1]:.1f} for "
     "skani), and both lose AF on very fragmented assemblies (3 kbp contigs) at 90% ANI.",
@@ -910,6 +912,51 @@ para("<b>Shorter k-mers</b> (17/13) survive mutation more often, so walks keep e
      "in real genomes 13- and 17-mers recur far more often, producing spurious seeds and probe matches, so a change of "
      "default needs validation on real genome pairs first.")
 
+
+h2("6.8 Genome length")
+para("To check how cost and accuracy scale, the benchmark was repeated on genomes of 10, 50 and 100 Mbp (the same 32 "
+     "scenarios, simulated with the same seeds at each length). At each length all tools ran in one interleaved session "
+     "(one pinned core, fastest of 3); the server's load differed between sessions, so times compare across tools within "
+     "a length, not across lengths. The 10 Mbp rows therefore differ slightly from Table 4.")
+LTOOLS = [("aiips", "aiips"), ("aiips:both", "aiips, both flags"), ("skani", "skani 0.4.0"),
+          ("first-commit", "aiips, first commit")]
+rows = [["Length", "Tool", "ANI MAE", "AF MAE", "Wall (ms)", "Slowest (ms)", "User (ms)", "System (ms)", "Memory (MiB)"]]
+for n in (10, 50, 100):
+    for t, lab in LTOOLS:
+        sel = [r for r in LENGTHS[n] if r["tool"] == t]
+        x = summary(sel)
+        slowest = max(float(r["wall_s"]) for r in sel) * 1000
+        rows.append([f"{n} Mbp", lab + (" ¹" if x["missing"] else ""), fmt(x["ani"]), fmt(x["af"], 1),
+                     f"{x['wall_s']:.0f}", f"{slowest:,.0f}", f"{x['user_s']:.0f}", f"{x['sys_s']:.0f}", f"{x['rss']:.1f}"])
+table(rows, [0.6, 1.45, 0.6, 0.55, 0.62, 0.72, 0.62, 0.7, 0.75], "Genome length: all 32 pairs at 10, 50 and 100 Mbp "
+      "(percentage points; mean cost per pair). ¹ skani reported no value for the 80% ANI pair at 10 Mbp; it reported "
+      "every pair at 50 and 100 Mbp.", align_center_from=2)
+def _skip_effect():
+    out = []
+    for n in (10, 50, 100):
+        by = {}
+        for r in LENGTHS[n]:
+            by.setdefault(r["scenario"], {})[r["tool"]] = r
+        dw = st.mean(float(v["aiips:skip"]["wall_s"]) - float(v["aiips"]["wall_s"]) for v in by.values()) * 1000
+        da = summary([v["aiips:skip"] for v in by.values()])["ani"] - summary([v["aiips"] for v in by.values()])["ani"]
+        out.append((n, dw, da))
+    return out
+_sk = _skip_effect()
+para("Time grows about linearly with length for both tools. AIIPS stays slightly faster than skani at every length "
+     "with equal user time; the difference is system time, as AIIPS touches about 30% less memory. Accuracy is stable "
+     "for AIIPS, while skani's AF error grows from 8.4 to 11.1 points because its alignment fraction falls further on the "
+     "80–85% ANI pairs of longer genomes. The first commit's redundant walks on genomes with indels (Section 4.5) grow "
+     "with length: its slowest pair takes over 15 s at 100 Mbp.")
+para("<b>A tweak tested and reverted.</b> Taking an island between two consecutive matched anchor pairs as aligned "
+     "without comparing its probes (whose matches then no longer count toward ANI) was tried at all three lengths. AF did "
+     "not change, since such islands are always aligned, but the time saved was negligible (mean change per pair "
+     + ", ".join(f"{dw:+.1f} ms at {n} Mbp" for n, dw, _ in _sk) + ") because probe comparison is a small part of the "
+     "comparison, which is itself small next to sketching; ANI error rose by about "
+     + f"{st.mean(da for *_, da in _sk):.2f}" + " points, as skipped islands carry most of the probe evidence at high "
+     "identity and the remaining ones are enriched for islands holding a mutation. The tweak was therefore not kept; its "
+     "runs remain in the result files under the labels <font face='Mono'>aiips:skip</font> and "
+     "<font face='Mono'>aiips:both+skip</font>.")
+
 # ================================================================ 7 Discussion
 h1("7. Limitations and next steps")
 h2("7.1 Limitations")
@@ -986,8 +1033,9 @@ code("# k-mer size sweep (Section 6.7)\n"
      "python3 reports/build_report.py . reports/aiips_progress_report.pdf")
 para("All tables and figures are computed from the committed files in <font face='Mono'>benchmarks/</font>: "
      "<font face='Mono'>simulated-10mb.tsv</font> with <font face='Mono'>simulated-10mb-truth.tsv</font>, "
-     "<font face='Mono'>simulated-10mb-ksweep.tsv</font>, <font face='Mono'>simulated-5mb.tsv</font> and "
-     "<font face='Mono'>simulated-5mb-gap-sweep.tsv</font>.")
+     "<font face='Mono'>simulated-10mb-ksweep.tsv</font>, <font face='Mono'>simulated-length-{10,50,100}mb.tsv</font> "
+     "(truth for 50 and 100 Mbp in <font face='Mono'>simulated-{50,100}mb-truth.tsv</font>), "
+     "<font face='Mono'>simulated-5mb.tsv</font> and <font face='Mono'>simulated-5mb-gap-sweep.tsv</font>.")
 
 
 # ---------------------------------------------------------------- build
