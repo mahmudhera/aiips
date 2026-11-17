@@ -4,10 +4,14 @@
 ## Summary
 
 AIIPS means Anchor Indexed Island Probe Sketching. This project explores nested
-sketching. Currently, the CLI builds classic MinHash or FracMinHash sketches of
-FASTA/FASTQ files and compares two sketches, estimating Jaccard, containment, and
-ANI. Other sketch algorithms (bottomk, minimizer, open-syncmer, closed-syncmer,
-strobemer) are reserved names, not yet implemented.
+sketching. The CLI builds classic MinHash or FracMinHash sketches of FASTA/FASTQ
+files and compares two sketches, estimating Jaccard, containment, and ANI. It
+also builds AIIPS sketches (`-a aiips`): two nested, positional FracMinHash
+samples, sparse long anchors and dense short probes between them, compared by
+walking from matched anchors through the islands between anchors, which
+estimates both ANI and alignment fraction (AF). Other sketch algorithms (bottomk,
+minimizer, open-syncmer, closed-syncmer, strobemer) are reserved names, not yet
+implemented.
 
 ## Build
 
@@ -37,6 +41,10 @@ in `Cargo.lock`.
 
 ./target/release/aiips sketch data/phiX174_NC_001422.1.fasta -a fracminhash --scaled 10 -o phix_frac
 ./target/release/aiips compare phix_frac.aiips data/phiX174_NC_001422.1.fasta
+
+./target/release/aiips sketch genome_a.fa -a aiips -o genome_a
+./target/release/aiips compare genome_a.aiips genome_b.fa
+./target/release/aiips compare genome_a.fa genome_b.fa -a aiips --symmetric-probes --bidirectional
 ```
 
 The previous `aiips INPUT...` interface has been removed. A subcommand is required.
@@ -51,14 +59,18 @@ aiips sketch INPUT -o OUTPUT [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [-
 ```
 
 `-a`/`--algorithm` is `minhash` (the default, so commands without it keep
-working) or `fracminhash`.
+working), `fracminhash`, or `aiips`.
 Reserved names (bottomk, minimizer, open-syncmer, closed-syncmer, strobemer) are
-refused as "not implemented yet"; other names are unknown. Both algorithms take
-`-k` from 1 to 32 (default 21) and `--seed`, any unsigned 64-bit integer (default
-42). MinHash also takes `-s`/`--num-hashes` from 2 to 1,000,000 (default 1000);
-FracMinHash takes `--scaled`, an integer scale factor from 1 to 2^64 - 1 (default
-1000). Options that do not apply to the chosen algorithm (`--scaled` with
-MinHash, `-s` with FracMinHash) are errors. Each option may be given once. An
+refused as "not implemented yet"; other names are unknown. MinHash and
+FracMinHash take `-k` from 1 to 32 (default 21); all three take `--seed`, any
+unsigned 64-bit integer (default 42). MinHash also takes `-s`/`--num-hashes` from
+2 to 1,000,000 (default 1000); FracMinHash takes `--scaled`, an integer scale
+factor from 1 to 2^64 - 1 (default 1000). AIIPS takes `--anchor-k` (2 to 32,
+default 21), `--anchor-scaled` (default 500), `--probe-k` (1 to anchor k - 1,
+default 15) and `--probe-scaled` (default 100) instead of `-k`, `-s` and
+`--scaled`. Options that do not apply to the chosen algorithm (`--scaled` with
+MinHash, `-s` with FracMinHash, `-k` with AIIPS, the AIIPS options with the
+others) are errors. Each option may be given once. An
 input without any valid k-mer is refused and creates no output. A FracMinHash
 sketch that keeps no hash value is still written, with a warning on stderr,
 because it is a valid sample; it cannot be compared.
@@ -135,11 +147,33 @@ records=2 bases=13 non_acgt_bases=2 valid_kmers=7
 ...
 ```
 
+An AIIPS sketch lists each record (`c LENGTH`), then each of its anchors in
+position order (`a POS STRAND HASH` for a k1 anchor, `p POS STRAND HASH` for a
+promoted k2 anchor, always the record's first), each followed by the probes of
+the island after it (`q POS STRAND HASH`). Positions are zero-based starts in the
+record; the strand is `+` when the k-mer's forward code is canonical, `-` when its
+reverse complement is. `contigs`, `anchors` and `probes` are the line counts:
+
+```text
+aiips-sketch v1 algorithm=aiips anchor_k=21 anchor_scaled=500 probe_k=15 probe_scaled=100 seed=42 hash=murmur3-fmix64 canonical=true contigs=1 anchors=2084 probes=9353
+records=1 bases=1000000 non_acgt_bases=0 valid_kmers=999986
+c 1000000
+p 30 + 56731525506569147
+q 30 + 56731525506569147
+q 44 + 120953976884060884
+q 100 - 89964033739757942
+...
+```
+
 Reading is strict: unknown, missing, or duplicate fields, a wrong value count,
 non-decimal values, FracMinHash values out of order, repeated, or above the
 `scaled` threshold, carriage returns, a missing final newline, or another version
-are errors. A FracMinHash file may not exceed 21 bytes per declared value plus
-4096 bytes; every other sketch file is bounded by the largest MinHash sketch. Zero-byte files written by earlier placeholder versions are rejected
+are errors. AIIPS records must hold their k-mers in order, inside the record,
+below their thresholds, with no probe overlapping a k1 anchor and the promoted
+anchor (if any) first and repeated as its island's first probe. A FracMinHash
+file may not exceed 21 bytes per declared value plus 4096 bytes, an AIIPS file 13
+bytes per declared record plus 36 per declared k-mer plus 4096; every other sketch
+file is bounded by the largest MinHash sketch. Zero-byte files written by earlier placeholder versions are rejected
 with a hint to re-run `aiips sketch`.
 
 ### MinHash
@@ -176,6 +210,111 @@ compacted (sorted, deduplicated) whenever the buffer doubles, so memory is
 proportional to the number of distinct retained hashes, about `|A| / S`;
 sequences are never stored.
 
+### AIIPS
+
+An AIIPS sketch samples two k-mer sizes with two independent hash functions, both
+by the FracMinHash rule. Per record (contig):
+
+- Anchors: canonical k1-mers whose hash `fmix64(x XOR seed_0)` is at most
+  `floor((2^64 - 1) / S1)` (`--anchor-k`, default 21; `--anchor-scaled`, default
+  500), i.e. a FracMinHash sample at k1.
+- Probes: canonical k2-mers, k2 < k1, whose hash `fmix64(x XOR seed_1)` is at most
+  `floor((2^64 - 1) / S2)` (`--probe-k`, default 15; `--probe-scaled`, default
+  100), excluding every k2-mer that overlaps an anchor. `seed_0` and `seed_1` are
+  the first two SplitMix64 outputs of `--seed`.
+- Islands: the stretch from an anchor to the next anchor or the record end. Every
+  probe belongs to the island it lies in; island lengths follow from the stored
+  positions.
+- The record's first probe before its first anchor (or its first probe, if it has
+  no anchor) becomes an anchor too, so the first sampled k-mer of every record is
+  an anchor and no island lacks a preceding anchor. It also stays a probe of its
+  island (a design decision: it is a sampled k2-mer like the other genome's copy,
+  so containment counts it like any probe).
+
+Every k-mer keeps its position and strand. With the defaults a 5 Mbp genome has
+about 10,000 anchors and 50,000 probes. Sketching is one pass and two hashes per
+base; records are scanned as 8 segments side by side so the work maps onto vector
+registers, compiled for AVX-512, AVX2 and baseline x86-64 and chosen at runtime
+(other architectures use the baseline code). Every path gives identical sketches.
+`valid_kmers` counts probe-length (k2) windows.
+
+`compare` with AIIPS sketches, or with `-a aiips` for two sequence inputs:
+
+1. Seeds: anchor pairs with equal hash (k1 anchors with k1 anchors; a promoted
+   anchor with any sampled k2-mer of the other genome). A hash occurring more than
+   32 times in either genome is skipped. Strands give the relative orientation.
+2. Walks: from a seed, the island after the anchor in one genome is compared with
+   the island after (same orientation) or before (opposite orientation) the
+   matched k-mer in the other, each genome keeping its own islands. When the next
+   anchors are the same k-mer both genomes cross them and the walk re-anchors;
+   otherwise the genome whose island ends first (by island length) crosses its
+   next anchor, so an island can pair with several of the other genome's. A seed
+   walks forward from the anchor in each genome whose anchor it is (one walk if the
+   strands agree, two if not).
+3. An island is judged when the walk leaves it, from all the probes it shared with
+   the islands it was paired with: it is high enough when that fraction is at
+   least `X^k2` (`--min-island-ani X`, default 0.8, so effectively one shared
+   probe). When both genomes leave an island together, either passing suffices
+   ("containment in either genome"); matched next anchors always pass. The walk
+   goes beyond low islands but stops after more than `--max-gap G` consecutive low
+   judgements (default 50) or at a record end, where the other genome's island is
+   clipped. It is then cut back to its last high judgement and trimmed to its last
+   shared k-mer, except that a walk reaching a record end with no low island since
+   its last high one keeps its islands up to that end.
+4. Overlapping walks (repeats) are resolved best first by score (shared probes plus
+   matched anchors). An island's probe counts come from the first walk claiming it
+   and its aligned bases from the union of the walks' spans; each anchor counts
+   once.
+5. ANI: the maximum-likelihood per-base identity `q` from the anchors crossed
+   inside walks (`n1` of `N1` matched, k1) and the probes of aligned islands (`n2`
+   of `N2` shared, k2), pooled over both genomes, assuming each k-mer of length k
+   matches independently with probability `q^k`:
+   `log L(q) = n1 k1 ln q + (N1 - n1) ln(1 - q^k1) + n2 k2 ln q + (N2 - n2) ln(1 - q^k2)`.
+   With one k-mer size this is the containment estimate `(n/N)^(1/k)` (Hera,
+   Pierce-Ward & Koslicki 2023); `log L` is concave in `ln q`, and its maximum is
+   found by bisection. Anchors and probes never overlap, so they share no bases.
+   Seed anchors are left out because they were selected for matching. `ani_a` and
+   `ani_b` are the same estimate from one genome's counts.
+6. AF: aligned bases over all bases, in each genome.
+
+Output after the statistics table (`-1` for an ANI when nothing aligned):
+
+```text
+input_a\tinput_b\tani\taf_a_to_b\taf_b_to_a\tani_a\tani_b\tanchors_matched\tanchors\tprobes_matched\tprobes
+a.fa\tb.fa\t0.950404\t0.999604\t0.999604\t0.950592\t0.950217\t6730\t19766\t41590\t89049
+```
+
+(Here B is A with 5% of its 5 Mbp substituted, true ANI 0.94998, compared with
+`--symmetric-probes --bidirectional`. The counts are summed over both genomes.)
+
+Two opt-in flags change the comparison, not the sketch:
+
+- `--symmetric-probes`: a probe counts only if it also avoids the other genome's
+  anchors at the same walk offset (re-estimated at each shared probe to follow
+  indels). Without it the exclusion rule differs between genomes wherever an
+  anchor is mutated away in one of them: that genome keeps probes the other
+  lacks, which lowers containment (by about 6% at 90% ANI with the defaults). On
+  the benchmark below the plain estimate is 0.1-0.35 ANI points low on
+  substitution-only pairs; with the flag it is within 0.05 on average.
+- `--bidirectional`: seeds also walk backward, which recovers the part of each
+  homologous stretch before its first matched anchor (contig starts, breakpoints).
+  Second-direction walks start only from seeds no earlier walk passed.
+
+Decisions beyond the specified algorithm, flagged here: islands are judged when
+completed rather than per island pair (pairs of islands overlapping by a few
+bases otherwise fail and end walks); low islands inside a walk count toward ANI
+(dropping them biases ANI up); walks tolerate up to `G` low islands (with about 5
+probes per island, an island has no shared probe with probability 0.35 at 90% ANI
+even when homologous; `G` was tuned on the simulated benchmark, where larger
+values only extend true alignments); walks are trimmed to their last shared
+k-mer; seed anchors are excluded from the likelihood.
+
+Limitations: indels destroy k-mers like substitutions, so ANI computed over
+gap-free aligned columns is underestimated when indels are frequent (as for
+skani); a straddling island can add a few hundred bases of AF at each breakpoint;
+at low ANI with short contigs some contigs hold no matched seed and are missed;
+records are limited to 2^32 - 1 bases and k1 to 32.
+
 ### Compare two inputs
 
 ```text
@@ -196,10 +335,14 @@ are sequences, the algorithm comes from `-a` (default `minhash`) and the
 parameters from the options, with the `sketch` defaults. A sequence input without
 valid k-mers is an error.
 
-Unless both inputs are MinHash or both are FracMinHash, `compare` halts and names
+Unless both inputs are of one implemented algorithm, `compare` halts and names
 each input's type. Two MinHash sketches must agree in `k`, `num_hashes`, `seed`,
 `hash`, and `canonical`; two FracMinHash sketches in `k`, `scaled`, `seed`, `hash`,
-and `canonical`. Every differing field is reported. An empty FracMinHash sketch
+and `canonical`; two AIIPS sketches in `anchor_k`, `anchor_scaled`, `probe_k`,
+`probe_scaled`, `seed`, `hash`, and `canonical`. Every differing field is
+reported. The AIIPS comparison options (`--max-gap`, `--min-island-ani`,
+`--symmetric-probes`, `--bidirectional`) are errors with the other algorithms;
+AIIPS output is described above. An empty FracMinHash sketch
 halts the comparison, because its containment is undefined.
 
 Output contains a statistics table, a blank line, and a
@@ -315,12 +458,83 @@ Command-specific help takes precedence over invalid arguments anywhere before
   MinHash construction and estimators (`minhash.rs`), and FracMinHash
   construction and estimators (`fracminhash.rs`). FracMinHash comparison merges
   the two sorted sketches in linear time.
+- `src/sketch/aiips.rs` holds AIIPS sketching (vectorized scan with runtime
+  instruction-set dispatch, no extra dependencies), the format, the walk, and the
+  likelihood. Comparison joins sorted seed hashes and touches each island a
+  bounded number of times; its memory is linear in the sketch sizes.
 - The binary separates argument parsing, command execution and output handling,
   and TSV formatting. Memory scales with parser buffering and the largest record.
 
-Sketch algorithms other than MinHash and FracMinHash, debiased FracMinHash
-containment, AF estimation, k > 32, confidence intervals, quality filtering,
-parallel processing, and compression other than gzip remain unimplemented.
+Sketch algorithms other than MinHash, FracMinHash and AIIPS, debiased FracMinHash
+containment, AF for MinHash and FracMinHash, k > 32, confidence intervals, quality
+filtering, parallel processing, and compression other than gzip remain
+unimplemented.
+
+## Benchmark against skani
+
+`scripts/simulate.py OUTDIR` (standard library, fixed seeds) writes 32 pairs of
+5 Mbp genomes with known ANI and AF, and `scripts/benchmark.py` runs aiips and
+skani on them (one thread, FASTA inputs, so sketching is included; wall time and
+peak memory from `/usr/bin/time`, fastest of `--repeat` runs):
+
+```sh
+python3 scripts/simulate.py sim
+python3 scripts/benchmark.py sim/truth.tsv results.tsv --aiips target/release/aiips \
+    --skani "$(command -v skani)" --repeat 3 \
+    --variant both="--symmetric-probes --bidirectional"
+```
+
+Truth: ANI is one minus substitutions over aligned (homologous, gap-free) columns;
+AF is the fraction of a genome's bases with a homolog in the other. Scenarios:
+uniform substitutions (ANI 99.9% to 80%); B holding 20, 50 or 90% of A in blocks
+amid foreign sequence, at 1, 5 and 10% divergence; substitutions plus indels (a
+tenth of the substitution rate, lengths mean 3, at most 30) with B in one record
+or in contigs of mean 50, 10 or 3 kbp in random orientation; and A with repeat
+families (40 families, 2-5 copies of 1-7 kbp, up to 1% diverged) against B
+substituted, cut into about 40 blocks, shuffled and partly inverted.
+
+Results (`benchmarks/simulated-5mb.tsv`; truth in
+`benchmarks/simulated-5mb-truth.tsv`), with skani 0.4.0 at its defaults and
+`--min-af 0`. Errors are in percentage points, AF over both directions; time and
+memory are per pair on one thread of a shared Xeon Gold 5416S, where timings
+vary from run to run, so the tools were run interleaved:
+
+| Scenarios | Tool | ANI MAE | ANI bias | AF MAE | Time (s) | Memory (MiB) |
+|---|---|---|---|---|---|---|
+| Substitutions (8) | aiips | 0.17 | -0.17 | 1.5 | 0.050 | 20.4 |
+| Substitutions (8) | aiips, both flags | 0.05 | +0.05 | 0.5 | 0.054 | 20.4 |
+| Substitutions (8) | skani (1 pair not reported) | 0.45 | -0.44 | 11.1 | 0.040 | 18.8 |
+| Partial overlap (9) | aiips | 0.21 | -0.21 | 2.3 | 0.043 | 19.4 |
+| Partial overlap (9) | aiips, both flags | 0.08 | -0.03 | 0.5 | 0.050 | 19.3 |
+| Partial overlap (9) | skani | 0.88 | -0.88 | 3.4 | 0.036 | 17.7 |
+| Indels + draft contigs (12) | aiips | 0.64 | -0.64 | 10.7 | 0.053 | 19.4 |
+| Indels + draft contigs (12) | aiips, both flags | 0.43 | -0.43 | 8.0 | 0.066 | 19.4 |
+| Indels + draft contigs (12) | skani | 0.82 | -0.82 | 11.7 | 0.040 | 17.5 |
+| Repeats + rearrangements (3) | aiips | 0.12 | -0.12 | 1.1 | 0.057 | 21.5 |
+| Repeats + rearrangements (3) | aiips, both flags | 0.08 | +0.08 | 0.4 | 0.077 | 21.5 |
+| Repeats + rearrangements (3) | skani | 0.28 | -0.28 | 4.7 | 0.040 | 18.9 |
+| All 32 | aiips | 0.35 | -0.35 | 5.1 | 0.050 | 19.8 |
+| All 32 | aiips, both flags | 0.20 | -0.15 | 3.3 | 0.059 | 19.8 |
+| All 32 | skani (1 pair not reported) | 0.70 | -0.70 | 8.5 | 0.039 | 18.0 |
+
+Substitution sweep, ANI / AF of A:
+
+| True ANI | aiips | aiips, both flags | skani |
+|---|---|---|---|
+| 0.9990 | 0.9989 / 1.000 | 0.9990 / 1.000 | 0.9991 / 1.000 |
+| 0.9900 | 0.9896 / 1.000 | 0.9903 / 1.000 | 0.9892 / 0.999 |
+| 0.9699 | 0.9687 / 1.000 | 0.9705 / 1.000 | 0.9677 / 0.992 |
+| 0.9500 | 0.9481 / 1.000 | 0.9504 / 1.000 | 0.9438 / 0.986 |
+| 0.9199 | 0.9175 / 1.000 | 0.9204 / 1.000 | 0.9153 / 0.949 |
+| 0.9001 | 0.8975 / 0.999 | 0.9006 / 1.000 | 0.8975 / 0.875 |
+| 0.8496 | 0.8461 / 0.998 | 0.8495 / 0.999 | 0.8348 / 0.423 |
+| 0.7998 | 0.7981 / 0.887 | 0.8015 / 0.966 | not reported |
+
+Both tools underestimate ANI when indels are frequent (k-mers spanning an indel
+are lost), and both lose AF on 3 kbp contigs at 90% ANI (aiips 0.47-0.51 with both
+flags, skani 0.49). Simulated genomes are uniform random sequence, without the
+compositional structure of real genomes; skani's learned ANI regression was
+trained on real assemblies.
 
 ## Tests
 
@@ -370,6 +584,13 @@ containment ANI recovers 1 - p within 0.008 for MinHash and for FracMinHash at
 `--scaled` 1 and 10.
 SplitMix64 is checked against its published reference outputs, fmix64 by
 inversion.
+AIIPS sketches are checked against a brute-force builder (every window hashed
+from scratch, exclusion and promotion applied literally) on records with
+ambiguous bases, lane boundaries, and short and empty records, for every
+instruction set the machine offers; the likelihood against its closed form and a
+grid search; and comparisons against exact cases (identical genomes, reverse
+complement cut into contigs, half shared with a breakpoint, unrelated genomes) and
+1 Mbp genomes substituted at 1% and 5%.
 Integration tests exercise each command, all input combinations, gzip, known
 counts, output creation and preservation, errors, help, and removal of the old
 interface. They use Cargo's test executable and isolated temporary directories;

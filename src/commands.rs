@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aiips::fastx::Summary;
+use aiips::sketch::aiips::{self as aiips_sketch, AiipsEstimates, AiipsSketch};
 use aiips::sketch::fracminhash::{self, FracMinHashSketch};
 use aiips::sketch::minhash::{self, MinHashSketch};
 use aiips::sketch::{self as sketch_format, Estimates, Sketch};
@@ -53,7 +54,7 @@ fn read_sketch(path: &Path) -> Result<Sketch, String> {
 
 /// A compare input: a sketch file, or a FASTA/FASTQ file sketched in memory.
 enum CompareInput {
-    Sketch(Sketch),
+    Sketch(Box<Sketch>),
     Sequence,
 }
 
@@ -61,7 +62,7 @@ enum CompareInput {
 /// with the sketch magic and are otherwise read as FASTA/FASTQ.
 fn classify(path: &Path) -> Result<CompareInput, String> {
     if is_sketch(path) {
-        return read_sketch(path).map(CompareInput::Sketch);
+        return read_sketch(path).map(|s| CompareInput::Sketch(Box::new(s)));
     }
     let (file, _) = open_input(path)?;
     let mut prefix = Vec::with_capacity(sketch_format::MAGIC.len());
@@ -69,7 +70,7 @@ fn classify(path: &Path) -> Result<CompareInput, String> {
         .read_to_end(&mut prefix)
         .map_err(|e| error(path, e))?;
     if prefix == sketch_format::MAGIC.as_bytes() {
-        read_sketch(path).map(CompareInput::Sketch)
+        read_sketch(path).map(|s| CompareInput::Sketch(Box::new(s)))
     } else {
         Ok(CompareInput::Sequence)
     }
@@ -77,7 +78,7 @@ fn classify(path: &Path) -> Result<CompareInput, String> {
 
 fn unsupported_pair(paths: &[PathBuf; 2], kinds: [&str; 2]) -> String {
     format!(
-        "comparison requires two sketches of one algorithm, minhash or fracminhash ({}: {}, {}: {})",
+        "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips ({}: {}, {}: {})",
         paths[0].display(),
         kinds[0],
         paths[1].display(),
@@ -116,7 +117,7 @@ fn compare_sketches(
     let mut sketches = Vec::with_capacity(2);
     for (path, input) in paths.iter().zip(inputs) {
         sketches.push(match input {
-            CompareInput::Sketch(sketch) => sketch,
+            CompareInput::Sketch(sketch) => *sketch,
             CompareInput::Sequence => sketch_sequence(path, params.clone())?,
         });
     }
@@ -134,6 +135,7 @@ fn sketch_file(path: &Path, file: File, params: SketchParams) -> Result<Sketch, 
     let sketch = match params {
         SketchParams::MinHash(p) => MinHashSketch::build(file, p).map(Sketch::MinHash),
         SketchParams::FracMinHash(p) => FracMinHashSketch::build(file, p).map(Sketch::FracMinHash),
+        SketchParams::Aiips(p) => AiipsSketch::build(file, p).map(Sketch::Aiips),
     }
     .map_err(|e| error(path, e))?;
     if sketch.summary().is_some_and(|summary| summary.kmers == 0) {
@@ -145,9 +147,19 @@ fn sketch_file(path: &Path, file: File, params: SketchParams) -> Result<Sketch, 
     Ok(sketch)
 }
 
+/// Comparison results: global set estimates, or aiips ANI and AF.
+enum Comparison {
+    Global(Estimates),
+    Aiips(AiipsEstimates),
+}
+
 /// Estimates for two sketches of one algorithm with identical parameters;
 /// halts otherwise, naming each input's type or every differing field.
-fn estimate_pair(paths: &[PathBuf; 2], sketches: &[Sketch; 2]) -> Result<Estimates, String> {
+fn estimate_pair(
+    paths: &[PathBuf; 2],
+    sketches: &[Sketch; 2],
+    options: &AlgorithmOptions,
+) -> Result<Comparison, String> {
     let differ = |differences: Vec<String>| {
         format!(
             "{} and {}: sketch parameters differ: {}; re-sketch with identical parameters",
@@ -162,7 +174,7 @@ fn estimate_pair(paths: &[PathBuf; 2], sketches: &[Sketch; 2]) -> Result<Estimat
             if !differences.is_empty() {
                 return Err(differ(differences));
             }
-            minhash::estimate(a, b)
+            minhash::estimate(a, b).map(Comparison::Global)
         }
         [Sketch::FracMinHash(a), Sketch::FracMinHash(b)] => {
             let differences = a.params.mismatches(&b.params);
@@ -176,7 +188,18 @@ fn estimate_pair(paths: &[PathBuf; 2], sketches: &[Sketch; 2]) -> Result<Estimat
             {
                 return Err(error(path, fracminhash::EMPTY));
             }
-            fracminhash::estimate(a, b)
+            fracminhash::estimate(a, b).map(Comparison::Global)
+        }
+        [Sketch::Aiips(a), Sketch::Aiips(b)] => {
+            let differences = a.params.mismatches(&b.params);
+            if !differences.is_empty() {
+                return Err(differ(differences));
+            }
+            Ok(Comparison::Aiips(aiips_sketch::estimate(
+                a,
+                b,
+                options.walk(),
+            )))
         }
         [a, b] => Err(unsupported_pair(
             paths,
@@ -494,6 +517,7 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
             let bytes = match &sketch {
                 Sketch::MinHash(s) => s.to_bytes(),
                 Sketch::FracMinHash(s) => s.to_bytes(),
+                Sketch::Aiips(s) => s.to_bytes(),
                 Sketch::Unsupported(_) => unreachable!("only implemented sketches are built"),
             };
             let mut transaction =
@@ -527,7 +551,23 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
         }
         Command::Compare { inputs, options } => {
             let sketches = compare_sketches(&inputs, &options)?;
-            let estimates = estimate_pair(&inputs, &sketches)?;
+            if sketches[0].algorithm() != aiips::sketch::Algorithm::Aiips {
+                if let Some(flag) = [
+                    (options.max_gap.is_some(), "--max-gap"),
+                    (options.min_island_ani.is_some(), "--min-island-ani"),
+                    (options.symmetric_probes, "--symmetric-probes"),
+                    (options.bidirectional, "--bidirectional"),
+                ]
+                .into_iter()
+                .find_map(|(given, flag)| given.then_some(flag))
+                {
+                    return Err(format!(
+                        "{flag} applies only to aiips, not {}",
+                        sketches[0].algorithm().name()
+                    ));
+                }
+            }
+            let estimates = estimate_pair(&inputs, &sketches, &options)?;
             report::statistics(
                 output,
                 &[
@@ -536,9 +576,12 @@ pub fn execute(command: Command, output: &mut impl Write) -> Result<(), String> 
                 ],
             )
             .map_err(|e| format!("stdout: {e}"))?;
-            report::comparison(output, &inputs, &estimates)
-                .and_then(|()| output.flush())
-                .map_err(|e| format!("stdout: {e}"))
+            match &estimates {
+                Comparison::Global(e) => report::comparison(output, &inputs, e),
+                Comparison::Aiips(e) => report::aiips_comparison(output, &inputs, e),
+            }
+            .and_then(|()| output.flush())
+            .map_err(|e| format!("stdout: {e}"))
         }
     }
 }

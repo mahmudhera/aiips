@@ -2,19 +2,21 @@ use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use aiips::sketch::aiips::{self as aiips_sketch, AiipsParams, WalkOptions};
 use aiips::sketch::fracminhash::{self, FracMinHashParams};
 use aiips::sketch::minhash::{self, MinHashParams, MAX_NUM_HASHES, MIN_NUM_HASHES};
 use aiips::sketch::{Algorithm, Sketch};
 
 pub const HELP: &str = "Usage: aiips <COMMAND>\n\nCommands:\n  sketch   Sketch a FASTA/FASTQ file into a .aiips file\n  compare  Estimate similarity between two .aiips sketches\n\nUse aiips <COMMAND> --help for options. Stdin is not supported.";
-const SKETCH_HELP: &str = "Usage: aiips sketch INPUT -o OUTPUT [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED] [-f]\n\n  -o, --output PATH         Output path (.aiips appended if missing)\n  -a, --algorithm NAME      Sketch algorithm: minhash or fracminhash [default: minhash]\n  -k, --kmer-size LENGTH    k-mer length, 1 to 32 [default: 21]\n  -s, --num-hashes NUM      minhash: number of hash functions, 2 to 1000000 [default: 1000]\n      --scaled S            fracminhash: scale factor, keeps about 1/S of k-mers,\n                            1 to 18446744073709551615 [default: 1000]\n      --seed SEED           unsigned 64-bit hash seed [default: 42]\n  -f, --force               Replace an existing output\n  -h, --help                Print help\n\nReads plain/gzip FASTA or FASTQ; k-mers are canonical (strand-independent).\nReserved, not yet implemented: bottomk, minimizer, open-syncmer, closed-syncmer,\nstrobemer.\nUse -- before positional filenames beginning with -. Stdin is not supported.";
-const COMPARE_HELP: &str = "Usage: aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED]\n\n  -a, --algorithm NAME     Algorithm for FASTA/FASTQ inputs: minhash or fracminhash\n                           [default: minhash, or the sketch's algorithm]\n  -k, --kmer-size LENGTH   k-mer length [default: 21, or the sketch's k]\n  -s, --num-hashes NUM     minhash: number of hash functions [default: 1000]\n      --scaled S           fracminhash: scale factor [default: 1000]\n      --seed SEED          unsigned 64-bit hash seed [default: 42]\n  -h, --help               Print help\n\nEach input is a .aiips sketch or a plain/gzip FASTA/FASTQ file; mixed pairs are\nsupported. Sequence inputs are sketched in memory, using the other input's\nalgorithm and parameters when it is a sketch (given options must then match),\notherwise the options above. Sketches must share one algorithm and identical\nparameters. Prints Jaccard, containment and ANI estimates; AF is -1: it is not\nestimable from these sketches.\nUse -- before positional filenames beginning with -. Stdin is not supported.";
+const SKETCH_HELP: &str = "Usage: aiips sketch INPUT -o OUTPUT [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED] [-f]\n\n  -o, --output PATH         Output path (.aiips appended if missing)\n  -a, --algorithm NAME      Sketch algorithm: minhash, fracminhash or aiips [default: minhash]\n  -k, --kmer-size LENGTH    k-mer length, 1 to 32 [default: 21]\n  -s, --num-hashes NUM      minhash: number of hash functions, 2 to 1000000 [default: 1000]\n      --scaled S            fracminhash: scale factor, keeps about 1/S of k-mers,\n                            1 to 18446744073709551615 [default: 1000]\n      --seed SEED           unsigned 64-bit hash seed [default: 42]\n  -f, --force               Replace an existing output\n  -h, --help                Print help\n\naiips options (instead of -k, -s and --scaled):\n      --anchor-k LENGTH     anchor k-mer length k1, 2 to 32 [default: 21]\n      --anchor-scaled S     keep about 1/S of k1-mers as anchors [default: 500]\n      --probe-k LENGTH      probe k-mer length k2, below k1 [default: 15]\n      --probe-scaled S      keep about 1/S of k2-mers as probes [default: 100]\n\nReads plain/gzip FASTA or FASTQ; k-mers are canonical (strand-independent).\nReserved, not yet implemented: bottomk, minimizer, open-syncmer, closed-syncmer,\nstrobemer.\nUse -- before positional filenames beginning with -. Stdin is not supported.";
+const COMPARE_HELP: &str = "Usage: aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED]\n\n  -a, --algorithm NAME     Algorithm for FASTA/FASTQ inputs: minhash, fracminhash or aiips\n                           [default: minhash, or the sketch's algorithm]\n  -k, --kmer-size LENGTH   k-mer length [default: 21, or the sketch's k]\n  -s, --num-hashes NUM     minhash: number of hash functions [default: 1000]\n      --scaled S           fracminhash: scale factor [default: 1000]\n      --seed SEED          unsigned 64-bit hash seed [default: 42]\n  -h, --help               Print help\n\naiips options: --anchor-k, --anchor-scaled, --probe-k, --probe-scaled (as for\nsketch), and\n      --max-gap G          consecutive low islands tolerated by a walk [default: 50]\n      --min-island-ani X   an island is high enough when its probe containment is\n                           at least X^k2, 0 to 1 [default: 0.8]\n      --symmetric-probes   count a probe only if it also avoids the other genome's\n                           anchors (corrects a downward ANI bias)\n      --bidirectional      walk backward from each seed as well as forward\n\nEach input is a .aiips sketch or a plain/gzip FASTA/FASTQ file; mixed pairs are\nsupported. Sequence inputs are sketched in memory, using the other input's\nalgorithm and parameters when it is a sketch (given options must then match),\notherwise the options above. Sketches must share one algorithm and identical\nparameters. minhash and fracminhash print Jaccard, containment and ANI\nestimates with AF -1 (not estimable from them); aiips prints ANI and AF.\nUse -- before positional filenames beginning with -. Stdin is not supported.";
 
 /// Validated parameters for building one sketch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SketchParams {
     MinHash(MinHashParams),
     FracMinHash(FracMinHashParams),
+    Aiips(AiipsParams),
 }
 
 impl SketchParams {
@@ -23,6 +25,7 @@ impl SketchParams {
         match sketch {
             Sketch::MinHash(s) => Some(SketchParams::MinHash(s.params.clone())),
             Sketch::FracMinHash(s) => Some(SketchParams::FracMinHash(s.params.clone())),
+            Sketch::Aiips(s) => Some(SketchParams::Aiips(s.params.clone())),
             Sketch::Unsupported(_) => None,
         }
     }
@@ -31,18 +34,28 @@ impl SketchParams {
         match self {
             SketchParams::MinHash(p) => p.k,
             SketchParams::FracMinHash(p) => p.k,
+            SketchParams::Aiips(p) => p.probe_k,
         }
     }
 }
 
 /// Algorithm options as given on the command line; `None` means not given.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AlgorithmOptions {
     pub algorithm: Option<Algorithm>,
     pub k: Option<NonZeroUsize>,
     pub num_hashes: Option<usize>,
     pub scaled: Option<u64>,
     pub seed: Option<u64>,
+    pub anchor_k: Option<NonZeroUsize>,
+    pub anchor_scaled: Option<u64>,
+    pub probe_k: Option<NonZeroUsize>,
+    pub probe_scaled: Option<u64>,
+    /// Comparison-only aiips options.
+    pub max_gap: Option<u32>,
+    pub min_island_ani: Option<f64>,
+    pub symmetric_probes: bool,
+    pub bidirectional: bool,
 }
 
 impl AlgorithmOptions {
@@ -52,11 +65,70 @@ impl AlgorithmOptions {
         self.params_for(self.algorithm.unwrap_or(Algorithm::MinHash))
     }
 
+    fn aiips_flag_given(&self) -> Option<&'static str> {
+        [
+            (self.anchor_k.is_some(), "--anchor-k"),
+            (self.anchor_scaled.is_some(), "--anchor-scaled"),
+            (self.probe_k.is_some(), "--probe-k"),
+            (self.probe_scaled.is_some(), "--probe-scaled"),
+            (self.max_gap.is_some(), "--max-gap"),
+            (self.min_island_ani.is_some(), "--min-island-ani"),
+            (self.symmetric_probes, "--symmetric-probes"),
+            (self.bidirectional, "--bidirectional"),
+        ]
+        .into_iter()
+        .find_map(|(given, flag)| given.then_some(flag))
+    }
+
+    /// Walk options for an aiips comparison, with defaults.
+    pub fn walk(&self) -> WalkOptions {
+        let defaults = WalkOptions::default();
+        WalkOptions {
+            max_gap: self.max_gap.unwrap_or(defaults.max_gap),
+            min_island_ani: self.min_island_ani.unwrap_or(defaults.min_island_ani),
+            symmetric_probes: self.symmetric_probes,
+            bidirectional: self.bidirectional,
+        }
+    }
+
     /// Refuses options that do not apply to `algorithm`, then fills defaults.
     fn params_for(&self, algorithm: Algorithm) -> Result<SketchParams, String> {
         let k = self.k;
         let seed = self.seed;
+        if algorithm != Algorithm::Aiips {
+            if let Some(flag) = self.aiips_flag_given() {
+                return Err(format!(
+                    "{flag} applies only to aiips, not {}",
+                    algorithm.name()
+                ));
+            }
+        }
         match algorithm {
+            Algorithm::Aiips => {
+                for (given, flag) in [
+                    (self.k.is_some(), "-k/--kmer-size"),
+                    (self.num_hashes.is_some(), "-s/--num-hashes"),
+                    (self.scaled.is_some(), "--scaled"),
+                ] {
+                    if given {
+                        return Err(format!(
+                            "{flag} does not apply to aiips; use --anchor-k, --anchor-scaled, --probe-k and --probe-scaled"
+                        ));
+                    }
+                }
+                let size = |k: Option<NonZeroUsize>, default: usize| {
+                    k.unwrap_or(NonZeroUsize::new(default).unwrap())
+                };
+                Ok(SketchParams::Aiips(AiipsParams::new(
+                    size(self.anchor_k, aiips_sketch::DEFAULT_ANCHOR_K),
+                    self.anchor_scaled
+                        .unwrap_or(aiips_sketch::DEFAULT_ANCHOR_SCALED),
+                    size(self.probe_k, aiips_sketch::DEFAULT_PROBE_K),
+                    self.probe_scaled
+                        .unwrap_or(aiips_sketch::DEFAULT_PROBE_SCALED),
+                    seed.unwrap_or(aiips_sketch::DEFAULT_SEED),
+                )?))
+            }
             Algorithm::MinHash => {
                 if self.scaled.is_some() {
                     return Err("--scaled applies only to fracminhash, not minhash".into());
@@ -88,6 +160,7 @@ impl AlgorithmOptions {
         let algorithm = match template {
             SketchParams::MinHash(_) => Algorithm::MinHash,
             SketchParams::FracMinHash(_) => Algorithm::FracMinHash,
+            SketchParams::Aiips(_) => Algorithm::Aiips,
         };
         if let Some(given) = self.algorithm.filter(|a| *a != algorithm) {
             return Err(format!(
@@ -107,13 +180,52 @@ impl AlgorithmOptions {
             )),
             None => Ok(()),
         };
-        check(
-            "-k",
-            self.k.map(|k| k.to_string()),
-            "k",
-            template.k().to_string(),
-        )?;
+        if !matches!(template, SketchParams::Aiips(_)) {
+            check(
+                "-k",
+                self.k.map(|k| k.to_string()),
+                "k",
+                template.k().to_string(),
+            )?;
+        }
         match template {
+            SketchParams::Aiips(p) => {
+                let pairs = [
+                    (
+                        "--anchor-k",
+                        self.anchor_k.map(|k| k.to_string()),
+                        "anchor_k",
+                        p.anchor_k.to_string(),
+                    ),
+                    (
+                        "--anchor-scaled",
+                        self.anchor_scaled.map(|s| s.to_string()),
+                        "anchor_scaled",
+                        p.anchor_scaled.to_string(),
+                    ),
+                    (
+                        "--probe-k",
+                        self.probe_k.map(|k| k.to_string()),
+                        "probe_k",
+                        p.probe_k.to_string(),
+                    ),
+                    (
+                        "--probe-scaled",
+                        self.probe_scaled.map(|s| s.to_string()),
+                        "probe_scaled",
+                        p.probe_scaled.to_string(),
+                    ),
+                    (
+                        "--seed",
+                        self.seed.map(|s| s.to_string()),
+                        "seed",
+                        p.seed.to_string(),
+                    ),
+                ];
+                for (flag, given, name, value) in pairs {
+                    check(flag, given, name, value)?;
+                }
+            }
             SketchParams::MinHash(p) => {
                 check(
                     "-s",
@@ -263,6 +375,62 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 return Err(format!("{SCALED_RANGE}\n{help}"));
             }
             options.scaled = Some(scaled);
+        } else if option && (arg == "--anchor-k" || arg == "--probe-k") {
+            let (slot, name) = if arg == "--anchor-k" {
+                (&mut options.anchor_k, "anchor k-mer length")
+            } else {
+                (&mut options.probe_k, "probe k-mer length")
+            };
+            once(slot, name, help)?;
+            *slot = Some(number(
+                args.next(),
+                &format!("{name} must be a positive integer fitting usize"),
+                help,
+            )?);
+        } else if option && (arg == "--anchor-scaled" || arg == "--probe-scaled") {
+            let (slot, name) = if arg == "--anchor-scaled" {
+                (&mut options.anchor_scaled, "anchor scaled")
+            } else {
+                (&mut options.probe_scaled, "probe scaled")
+            };
+            once(slot, name, help)?;
+            let scaled: u64 = number(args.next(), SCALED_RANGE, help)?;
+            if scaled == 0 {
+                return Err(format!("{SCALED_RANGE}\n{help}"));
+            }
+            *slot = Some(scaled);
+        } else if option && !sketch && arg == "--max-gap" {
+            once(&options.max_gap, "max gap", help)?;
+            options.max_gap = Some(number(
+                args.next(),
+                "max gap must be an unsigned 32-bit integer",
+                help,
+            )?);
+        } else if option && !sketch && arg == "--min-island-ani" {
+            once(&options.min_island_ani, "min island ANI", help)?;
+            let value: f64 = number(
+                args.next(),
+                "min island ANI must be a number from 0 to 1",
+                help,
+            )?;
+            if !(0.0..=1.0).contains(&value) {
+                return Err(format!(
+                    "min island ANI must be a number from 0 to 1\n{help}"
+                ));
+            }
+            options.min_island_ani = Some(value);
+        } else if option && !sketch && arg == "--symmetric-probes" {
+            if std::mem::replace(&mut options.symmetric_probes, true) {
+                return Err(format!(
+                    "--symmetric-probes may only be specified once\n{help}"
+                ));
+            }
+        } else if option && !sketch && arg == "--bidirectional" {
+            if std::mem::replace(&mut options.bidirectional, true) {
+                return Err(format!(
+                    "--bidirectional may only be specified once\n{help}"
+                ));
+            }
         } else if option && arg == "--seed" {
             once(&options.seed, "seed", help)?;
             options.seed = Some(number(

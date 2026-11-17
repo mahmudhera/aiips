@@ -4,6 +4,7 @@
 //! records its sketch type and parameters. The remaining lines belong to the
 //! algorithm. Parsing is strict: malformed files are rejected, never guessed.
 
+pub mod aiips;
 pub mod fracminhash;
 pub mod minhash;
 
@@ -14,13 +15,14 @@ use crate::fastx::Summary;
 pub const MAGIC: &str = "aiips-sketch";
 pub const VERSION: &str = "v1";
 
-/// Every algorithm name the CLI and the format recognize. `MinHash` and
-/// `FracMinHash` are implemented; the others are reserved so files and errors
-/// stay unambiguous.
+/// Every algorithm name the CLI and the format recognize. `MinHash`,
+/// `FracMinHash` and `Aiips` are implemented; the others are reserved so files
+/// and errors stay unambiguous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     MinHash,
     FracMinHash,
+    Aiips,
     BottomK,
     Minimizer,
     OpenSyncmer,
@@ -29,9 +31,10 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
-    pub const ALL: [Algorithm; 7] = [
+    pub const ALL: [Algorithm; 8] = [
         Algorithm::MinHash,
         Algorithm::FracMinHash,
+        Algorithm::Aiips,
         Algorithm::BottomK,
         Algorithm::Minimizer,
         Algorithm::OpenSyncmer,
@@ -43,6 +46,7 @@ impl Algorithm {
         match self {
             Algorithm::MinHash => "minhash",
             Algorithm::FracMinHash => "fracminhash",
+            Algorithm::Aiips => "aiips",
             Algorithm::BottomK => "bottomk",
             Algorithm::Minimizer => "minimizer",
             Algorithm::OpenSyncmer => "open-syncmer",
@@ -56,7 +60,10 @@ impl Algorithm {
     }
 
     pub fn is_implemented(self) -> bool {
-        matches!(self, Algorithm::MinHash | Algorithm::FracMinHash)
+        matches!(
+            self,
+            Algorithm::MinHash | Algorithm::FracMinHash | Algorithm::Aiips
+        )
     }
 
     /// Comma-separated names of the implemented algorithms.
@@ -80,6 +87,7 @@ impl Algorithm {
 pub enum Sketch {
     MinHash(minhash::MinHashSketch),
     FracMinHash(fracminhash::FracMinHashSketch),
+    Aiips(aiips::AiipsSketch),
     Unsupported(Algorithm),
 }
 
@@ -88,6 +96,7 @@ impl Sketch {
         match self {
             Sketch::MinHash(_) => Algorithm::MinHash,
             Sketch::FracMinHash(_) => Algorithm::FracMinHash,
+            Sketch::Aiips(_) => Algorithm::Aiips,
             Sketch::Unsupported(algorithm) => *algorithm,
         }
     }
@@ -97,15 +106,18 @@ impl Sketch {
         match self {
             Sketch::MinHash(s) => Some(&s.summary),
             Sketch::FracMinHash(s) => Some(&s.summary),
+            Sketch::Aiips(s) => Some(&s.summary),
             Sketch::Unsupported(_) => None,
         }
     }
 
-    /// k-mer length; `None` for unsupported sketches.
+    /// k-mer length (the probe k for aiips, which its summary counts);
+    /// `None` for unsupported sketches.
     pub fn k(&self) -> Option<NonZeroUsize> {
         match self {
             Sketch::MinHash(s) => Some(s.params.k),
             Sketch::FracMinHash(s) => Some(s.params.k),
+            Sketch::Aiips(s) => Some(s.params.probe_k),
             Sketch::Unsupported(_) => None,
         }
     }
@@ -128,8 +140,9 @@ pub const HEADER_BYTES: u64 = 4096;
 
 /// Largest file accepted for a sketch whose file starts with `prefix`, so
 /// files are bounded before being read. FracMinHash files are bounded by the
-/// `size` their header declares (each value at most 20 digits plus newline);
-/// every other file by the largest MinHash sketch. Parsing still validates.
+/// `size` their header declares (each value at most 20 digits plus newline),
+/// aiips files by their declared record, anchor and probe counts; every other
+/// file by the largest MinHash sketch. Parsing still validates.
 pub fn max_file_bytes(prefix: &[u8]) -> u64 {
     let minhash = 21 * minhash::MAX_NUM_HASHES as u64 + HEADER_BYTES;
     let header = prefix.split(|&b| b == b'\n').next().unwrap_or_default();
@@ -141,19 +154,35 @@ pub fn max_file_bytes(prefix: &[u8]) -> u64 {
         return minhash;
     }
     let fields: Vec<&str> = fields.collect();
+    let declared = |key: &str| match fields
+        .iter()
+        .filter_map(|f| f.strip_prefix(key))
+        .collect::<Vec<_>>()[..]
+    {
+        [value] => parse_u64(value),
+        _ => None,
+    };
+    if fields.contains(&"algorithm=aiips") {
+        // Record lines are at most 13 bytes ("c " + 10 digits + newline);
+        // k-mer lines at most 36 ("q " + 10 + " - " + 20 + newline).
+        return match (
+            declared("contigs="),
+            declared("anchors="),
+            declared("probes="),
+        ) {
+            (Some(contigs), Some(anchors), Some(probes)) => contigs
+                .saturating_mul(13)
+                .saturating_add(anchors.saturating_add(probes).saturating_mul(36))
+                .saturating_add(HEADER_BYTES),
+            _ => minhash,
+        };
+    }
     if !fields.contains(&"algorithm=fracminhash") {
         return minhash;
     }
-    match fields
-        .iter()
-        .filter_map(|f| f.strip_prefix("size="))
-        .collect::<Vec<_>>()[..]
-    {
-        [size] => parse_u64(size).map_or(minhash, |size| {
-            size.saturating_mul(21).saturating_add(HEADER_BYTES)
-        }),
-        _ => minhash,
-    }
+    declared("size=").map_or(minhash, |size| {
+        size.saturating_mul(21).saturating_add(HEADER_BYTES)
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,6 +247,7 @@ pub fn parse(bytes: &[u8]) -> Result<Sketch, ParseError> {
         Algorithm::FracMinHash => {
             fracminhash::FracMinHashSketch::parse_body(params, lines).map(Sketch::FracMinHash)
         }
+        Algorithm::Aiips => aiips::AiipsSketch::parse_body(params, lines).map(Sketch::Aiips),
         other => Ok(Sketch::Unsupported(other)),
     }
 }
@@ -309,15 +339,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn algorithm_names_round_trip_and_minhash_and_fracminhash_are_implemented() {
+    fn algorithm_names_round_trip_and_implemented_algorithms_are_listed() {
         for algorithm in Algorithm::ALL {
             assert_eq!(Algorithm::from_name(algorithm.name()), Some(algorithm));
             assert_eq!(
                 algorithm.is_implemented(),
-                matches!(algorithm, Algorithm::MinHash | Algorithm::FracMinHash)
+                matches!(
+                    algorithm,
+                    Algorithm::MinHash | Algorithm::FracMinHash | Algorithm::Aiips
+                )
             );
         }
-        assert_eq!(Algorithm::implemented_names(), "minhash, fracminhash");
+        assert_eq!(
+            Algorithm::implemented_names(),
+            "minhash, fracminhash, aiips"
+        );
         assert_eq!(Algorithm::from_name("MinHash"), None);
         assert_eq!(Algorithm::from_name(""), None);
     }

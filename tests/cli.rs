@@ -981,7 +981,7 @@ fn compare_halts_unless_both_sketches_are_implemented() {
         t.failure(
             &["compare", "a.aiips", "other.aiips"],
             &format!(
-                "comparison requires two sketches of one algorithm, minhash or fracminhash (a.aiips: minhash, other.aiips: {name})"
+                "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips (a.aiips: minhash, other.aiips: {name})"
             ),
         );
         t.failure(
@@ -993,7 +993,7 @@ fn compare_halts_unless_both_sketches_are_implemented() {
     t.write("other.aiips", b"aiips-sketch v1 algorithm=bottomk\n");
     t.failure(
         &["compare", "good.fa", "other.aiips", "-k", "3"],
-        "comparison requires two sketches of one algorithm, minhash or fracminhash (good.fa: fasta/fastq, other.aiips: bottomk)",
+        "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips (good.fa: fasta/fastq, other.aiips: bottomk)",
     );
     t.write("other.aiips", b"aiips-sketch v1 algorithm=hyperloglog\n");
     t.failure(
@@ -1115,7 +1115,7 @@ fn compare_help() {
         assert!(stdout.contains(
             "Usage: aiips compare INPUT_A INPUT_B [-a ALGORITHM] [-k LENGTH] [-s NUM] [--scaled S] [--seed SEED]"
         ));
-        assert!(stdout.contains("AF is -1"));
+        assert!(stdout.contains("AF -1 (not estimable from them); aiips prints ANI and AF"));
     }
 }
 
@@ -2014,7 +2014,7 @@ fn compare_halts_on_mixed_algorithms_and_fracminhash_mismatches() {
     t.sketch("good.fa", "m", &["-k", "3"]);
     t.failure(
         &["compare", "m.aiips", "f.aiips"],
-        "comparison requires two sketches of one algorithm, minhash or fracminhash (m.aiips: minhash, f.aiips: fracminhash)",
+        "comparison requires two sketches of one algorithm, minhash, fracminhash or aiips (m.aiips: minhash, f.aiips: fracminhash)",
     );
     t.failure(
         &["compare", "f.aiips", "m.aiips"],

@@ -146,6 +146,25 @@ expect_error "sketch refuses --scaled with minhash" "--scaled applies only to fr
     sketch "$fa" -a minhash -k 3 --scaled 10 -o missing
 [ ! -e missing.aiips ] || fail "refused sketch created missing.aiips"
 
+# aiips: tiny k so the 13-base fixtures hold anchors and probes.
+aiips_opts=(-a aiips --anchor-k 3 --anchor-scaled 2 --probe-k 2 --probe-scaled 1)
+aiips_counts=$'2\t13\t2\t2\t9'
+expect_stdout "sketch aiips fasta" \
+    "$stats"$'\n'"$fa"$'\t'"$aiips_counts"$'\noutput\taiips.aiips' \
+    sketch "$fa" "${aiips_opts[@]}" -o aiips
+[[ "$(head -n 1 aiips.aiips)" == 'aiips-sketch v1 algorithm=aiips anchor_k=3 anchor_scaled=2 probe_k=2 probe_scaled=1 seed=42 hash=murmur3-fmix64 canonical=true contigs=2 '* ]] ||
+    fail "aiips sketch: unexpected header: $(head -n 1 aiips.aiips)"
+expect_stdout "sketch aiips gzip fastq" \
+    "$stats"$'\n'"$fq"$'\t'"$aiips_counts"$'\noutput\taiipsreads.aiips' \
+    sketch "$fq" "${aiips_opts[@]}" -o aiipsreads
+cmp -s aiips.aiips aiipsreads.aiips || fail "fasta and gzip fastq aiips sketches differ"
+aiips_metrics=$'input_a\tinput_b\tani\taf_a_to_b\taf_b_to_a\tani_a\tani_b\tanchors_matched\tanchors\tprobes_matched\tprobes'
+expect_stdout "compare identical aiips sketches" \
+    "$stats"$'\naiips.aiips\t'"$aiips_counts"$'\naiipsreads.aiips\t'"$aiips_counts"$'\n\n'"$aiips_metrics"$'\naiips.aiips\taiipsreads.aiips\t1.000000\t1.000000\t1.000000\t1.000000\t1.000000\t0\t0\t10\t10' \
+    compare aiips.aiips aiipsreads.aiips
+expect_error "compare refuses minhash with aiips" "(sample.aiips: minhash, aiips.aiips: aiips)" \
+    compare sample.aiips aiips.aiips
+
 before=$(cat sample.aiips)
 expect_error "sketch refuses existing output" "use -f or --force" \
     sketch "$fa" -a minhash -k 3 -o sample

@@ -46,6 +46,23 @@ pub fn summarize_with<R: Read + Send>(
     Ok(summary)
 }
 
+/// Visits each record's sequence (line breaks removed), auto-detecting
+/// FASTA/FASTQ and gzip, and returns the number of records. For callers that
+/// compute their own statistics in their single pass over each sequence.
+pub fn for_each_sequence<R: Read + Send>(
+    input: R,
+    mut visit: impl FnMut(&[u8]),
+) -> Result<u64, ParseError> {
+    let mut reader = parse_fastx_reader(input)?;
+    let mut records = 0;
+    while let Some(record) = reader.next() {
+        let record = record?;
+        records += 1;
+        visit(&record.seq());
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
